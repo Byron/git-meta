@@ -142,10 +142,9 @@ pub(crate) struct Workload {
     pub prune_local: bool,
     /// Run object-store maintenance every N metadata commits. Zero disables it.
     ///
-    /// The library deliberately does not do this during serialize: `git gc`
-    /// detaches by default and would delete objects from underneath the live
-    /// session. A long-running in-process writer has to choose its own safe
-    /// point, which is what this models — maintain, then reopen the session.
+    /// The library leaves scheduling to the caller so compaction does not add
+    /// latency to individual writes. This models a long-running writer choosing
+    /// a batch boundary while retaining the same session.
     pub maintain_every: usize,
     pub span_days: i64,
     pub start_ms: i64,
@@ -399,10 +398,6 @@ fn generate_from(
         if workload.maintain_every > 0 && done % workload.maintain_every == 0 {
             let maintain_started = Instant::now();
             session.maintain_object_store();
-            // Reopen: gix fixes its view of the object store when the
-            // repository is opened, so the handle that asked for the packing
-            // cannot be the one that reads afterwards.
-            session = Session::open(repo_dir)?;
             maintain_total += maintain_started.elapsed();
         }
         if workload.checkpoint_every > 0 && done % workload.checkpoint_every == 0 {

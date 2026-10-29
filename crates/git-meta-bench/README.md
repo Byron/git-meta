@@ -54,7 +54,11 @@ The sparse scenario reports where a consumer's time goes between an empty
 directory and a usable store: clone, metadata fetch, tip-blob hydration,
 materialize (recreating every key in SQLite), and history indexing. `pull` does
 all of these in one call, so the breakdown is measured on a second identical
-clone with the steps run separately.
+clone with the steps run separately. Fetch, hydration, and repacking use gitoxide
+and keep the same session open throughout. The blobless arm applies its configured
+filter to metadata fetches too. Repacking retains local objects, including hydrated
+blobs outside the available graph; it is measured for storage compaction rather than
+to work around object-database capacity limits. Git remains the setup and size oracle.
 
 ## Modes
 
