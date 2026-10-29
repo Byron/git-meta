@@ -65,8 +65,7 @@ pub(crate) fn run_readme(remote: Option<&str>, verbose: bool) -> Result<()> {
         eprintln!("[verbose] created commit: {commit_oid}");
     }
 
-    // Push commit to refs/heads/main on the remote, but only if it doesn't exist.
-    // We use a refspec without '+' so it fails if the ref already exists.
+    // A root README commit cannot fast-forward an existing, different history.
     let push_refspec = format!("{commit_oid}:refs/heads/main");
 
     if verbose {
@@ -74,23 +73,18 @@ pub(crate) fn run_readme(remote: Option<&str>, verbose: bool) -> Result<()> {
     }
 
     eprintln!("Pushing README to {remote_name}...");
-    let result = git_meta_lib::git_utils::run_git(repo, &["push", &remote_name, &push_refspec]);
+    let result = git_meta_lib::git_utils::push(repo, &remote_name, &push_refspec);
 
-    match result {
-        Ok(_) => {
+    match result? {
+        gix::push::Status::Rejected(
+            gix::push::Rejection::NonFastForward | gix::push::Rejection::FetchFirst,
+        ) => {
+            bail!("refs/heads/main already exists on {remote_name}. The README can only be pushed to a new repository.");
+        }
+        gix::push::Status::Rejected(reason) => bail!("push rejected: {reason:?}"),
+        _ => {
             println!("Pushed README to {remote_name} (refs/heads/main)");
             Ok(())
-        }
-        Err(e) => {
-            let err_msg = e.to_string();
-            if err_msg.contains("non-fast-forward")
-                || err_msg.contains("rejected")
-                || err_msg.contains("fetch first")
-                || err_msg.contains("already exists")
-            {
-                bail!("refs/heads/main already exists on {remote_name}. The README can only be pushed to a new repository.");
-            }
-            bail!("push failed: {err_msg}");
         }
     }
 }
