@@ -11,7 +11,7 @@ repository = "https://github.com/git-meta/git-meta"
 [workspace.dependencies]
 anyhow = "1"
 gix = { version = "0.90.0", git = "https://github.com/GitoxideLabs/gitoxide", branch = "grix", default-features = false, features = [
-    "sha1", "revision", "merge", "blob-diff", "anyhow", "blocking-http-transport-reqwest-rust-tls", "blame", "pack-generate", "object-maintenance"
+    "sha1", "revision", "merge", "blob-diff", "anyhow", "blocking-http-transport-reqwest-rust-tls", "blame", "mailmap", "pack-generate", "object-maintenance"
 ] }
 rusqlite = { version = ">=0.33,<0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

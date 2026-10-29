@@ -17,6 +17,7 @@ mod log;
 mod maintenance;
 mod materialize;
 mod native;
+mod native_inspect;
 mod promisor;
 mod push_pull;
 mod remote;

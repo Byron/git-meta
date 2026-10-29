@@ -1069,6 +1069,7 @@ dependencies = [
  "gix-ignore",
  "gix-index",
  "gix-lock",
+ "gix-mailmap",
  "gix-merge",
  "gix-negotiate",
  "gix-note",
@@ -1464,6 +1465,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.116",
+]
+
+[[package]]
+name = "gix-mailmap"
+version = "0.36.1"
+source = "git+https://github.com/GitoxideLabs/gitoxide?branch=grix#ff0bc297d7dea42dd838667e168c274be30a4d63"
+dependencies = [
+ "bstr",
+ "gix-actor",
+ "gix-date",
+ "gix-error",
 ]
 
 [[package]]
