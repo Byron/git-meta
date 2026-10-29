@@ -212,13 +212,10 @@ impl Session {
         crate::git_utils::resolve_meta_remote(&self.repo, remote)
     }
 
-    /// Let Git pack the objects serialization has written.
+    /// Compact the objects serialization has written without expiring local objects.
     ///
-    /// Metadata is written straight through `gix`, and a metadata-only
-    /// repository runs nothing else, so without this the object store only ever
-    /// grows loose. Call it once work is finished and the process is about to
-    /// exit; see [`git_utils::maintain_object_store`] for why it must not run
-    /// while this session stays in use.
+    /// Call this after normal work to avoid maintenance latency during individual
+    /// writes. See [`git_utils::maintain_object_store`] for retention and failure behavior.
     ///
     /// [`git_utils::maintain_object_store`]: crate::git_utils::maintain_object_store
     pub fn maintain_object_store(&self) {

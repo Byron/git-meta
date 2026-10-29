@@ -78,10 +78,6 @@ pub enum Error {
     #[error("could not resolve: {0}")]
     ResolveError(String),
 
-    /// A git subprocess command failed.
-    #[error("git command failed: {0}")]
-    GitCommand(String),
-
     /// No metadata remotes are configured.
     #[error("no metadata remotes configured")]
     NoRemotes,

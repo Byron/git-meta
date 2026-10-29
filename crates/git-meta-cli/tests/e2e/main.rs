@@ -14,6 +14,7 @@ mod help;
 mod import_gh;
 mod list;
 mod log;
+mod maintenance;
 mod materialize;
 mod native;
 mod promisor;

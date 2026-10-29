@@ -1,7 +1,6 @@
 //! Git repository helpers for resolving objects and manipulating metadata refs.
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 
 use crate::error::{Error, Result};
 use gix::error::{ErrorExt, ResultExt};
@@ -21,50 +20,6 @@ pub(crate) fn is_list_entry_name(name: &str) -> bool {
     } else {
         false
     }
-}
-
-/// Resolve the working or git directory from a gix repository for subprocess calls.
-fn repo_dir(repo: &gix::Repository) -> Result<&std::path::Path> {
-    repo.workdir()
-        .unwrap_or_else(|| repo.git_dir())
-        .canonicalize()
-        .ok();
-    Ok(repo.workdir().unwrap_or_else(|| repo.git_dir()))
-}
-
-/// Run a git CLI command in the repository's working directory.
-///
-/// # Parameters
-///
-/// - `repo`: the Git repository whose working directory is used as `cwd`
-/// - `args`: the arguments to pass to `git`
-///
-/// # Returns
-///
-/// The stdout output of the command as a string.
-///
-/// # Errors
-///
-/// Returns an error if the subprocess fails to spawn or exits with a non-zero status.
-pub fn run_git(repo: &gix::Repository, args: &[&str]) -> Result<String> {
-    let workdir = repo_dir(repo)?;
-
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(workdir)
-        .output()
-        .map_err(|e| Error::GitCommand(format!("{e}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(Error::GitCommand(format!(
-            "git {} failed: {}",
-            args.first().unwrap_or(&""),
-            stderr.trim()
-        )));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 /// Count reachable metadata commits, honoring shallow boundaries.
@@ -571,75 +526,26 @@ pub(crate) fn resolve_commit_sha(repo: &gix::Repository, partial: &str) -> Resul
 /// repository does not set `gc.auto`. The same default Git uses.
 const DEFAULT_GC_AUTO: i64 = 6_700;
 
-/// Pack what serialization has written and drop what it has superseded.
+/// Pack the objects serialization has written, retaining every local object.
 ///
-/// Metadata is written straight through `gix`, and a metadata-only repository
-/// runs nothing else, so without this the object store only ever grows loose:
-/// a 25,000-commit history reached 1.4 million loose objects in 14 GB, for a
-/// history that packs to 801 MB, and a plain `git ls-tree -r` on it took over
-/// five minutes.
+/// Metadata-only repositories have no other automatic maintenance. Compacting
+/// loose objects keeps their storage and lookup costs bounded. Retaining all
+/// objects protects concurrent writers and hydrated blobs whose parent trees
+/// have not been fetched into a partial store. The native repacker preserves
+/// promisor boundaries and object ages for later garbage collection.
 ///
-/// Repacking does nearly all of that work. Metadata commits form a linear
-/// chain, so every historical tree and blob stays reachable — superseded tree
-/// nodes are not garbage, they are the record the deep-history read path walks
-/// back through. On a 300-commit history only 208 of 36,245 objects were
-/// unreachable, and repacking took the rest from 36,037 loose to one.
-///
-/// Pruning is still worth doing, for a smaller reason. Building a tree writes
-/// intermediate trees that the finished commit never references, at roughly
-/// 0.7 objects per commit. Left alone they are what eventually trips `git gc`,
-/// which refuses to delete unreachable objects younger than two weeks, keeps
-/// them loose, and then declines to run at all:
-///
-/// > There are too many unreachable loose objects; run 'git prune' to remove
-/// > them. Automatic cleanup will not be performed until the file is removed.
-///
-/// That is why this does the work directly rather than deferring to
-/// `gc --auto`. Pruning first keeps the repack from packing objects about to
-/// be discarded, and geometric repacking keeps the work proportional to what
-/// was added rather than rewriting the whole store every time.
-///
-/// # This must not be called while a [`gix::Repository`] stays in use
-///
-/// Objects are deleted here. A `Repository` handle opened beforehand will find
-/// them gone and fail with "object ... could not be found". Call it where the
-/// process is about to exit, as the CLI does, or reopen every handle after.
-///
-/// Maintenance failing is never a reason to fail work that already succeeded,
+/// Maintenance is best attempted after normal work to avoid adding latency to
+/// individual writes. Failure never invalidates work that already succeeded,
 /// so errors are ignored.
 pub fn maintain_object_store(repo: &gix::Repository) {
-    let Ok(workdir) = repo_dir(repo) else {
-        return;
-    };
-    if !has_many_loose_objects(repo, workdir) {
-        return;
+    if has_many_loose_objects(repo) {
+        let _ = repo.repack_objects(&std::sync::atomic::AtomicBool::default());
     }
-
-    let run = |args: &[&str]| {
-        let _ = Command::new("git")
-            .args(args)
-            .current_dir(workdir)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-    };
-
-    run(&["prune", "--expire=now"]);
-    run(&["repack", "-d", "--geometric=2", "--quiet"]);
 }
 
-/// Whether the object store holds enough loose objects to be worth packing.
-///
-/// The threshold comes from the repository's `gc.auto`, so a project that has
-/// tuned Git's own maintenance gets the same answer here, and `gc.auto = 0`
-/// disables maintenance exactly as it does for Git.
-///
-/// Counting stops as soon as the threshold is passed, which bounds the work
-/// either way: a store below the threshold has few objects to count, and one
-/// far above it is answered after the first few thousand. Git samples a single
-/// fan-out directory instead, which is cheaper still but reads as zero when
-/// that one directory happens to be empty.
-fn has_many_loose_objects(repo: &gix::Repository, workdir: &Path) -> bool {
+/// Count only enough local loose objects to decide whether packing is useful.
+/// `gc.auto <= 0` disables automatic maintenance, as it does in Git.
+fn has_many_loose_objects(repo: &gix::Repository) -> bool {
     let threshold = repo
         .config_snapshot()
         .integer("gc.auto")
@@ -650,39 +556,11 @@ fn has_many_loose_objects(repo: &gix::Repository, workdir: &Path) -> bool {
     if threshold == 0 {
         return false;
     }
-
-    let objects = {
-        let in_worktree = workdir.join(".git").join("objects");
-        if in_worktree.exists() {
-            in_worktree
-        } else {
-            // Bare repositories keep `objects` at the top level.
-            workdir.join("objects")
-        }
-    };
-    let Ok(fanout) = std::fs::read_dir(objects) else {
-        return false;
-    };
-
-    let mut counted = 0usize;
-    for directory in fanout.flatten() {
-        let name = directory.file_name();
-        let name = name.to_string_lossy();
-        if name.len() != 2 || !name.chars().all(|c| c.is_ascii_hexdigit()) {
-            continue;
-        }
-        let Ok(entries) = std::fs::read_dir(directory.path()) else {
-            continue;
-        };
-        for _ in entries.flatten() {
-            counted += 1;
-            if counted > threshold {
-                return true;
-            }
-        }
-    }
-
-    false
+    gix::odb::loose::Store::at(repo.objects.store_ref().path(), repo.object_hash())
+        .iter()
+        .filter_map(std::result::Result::ok)
+        .nth(threshold)
+        .is_some()
 }
 
 #[cfg(test)]
