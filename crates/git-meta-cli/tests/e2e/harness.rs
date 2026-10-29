@@ -67,6 +67,14 @@ pub(crate) fn git_meta(dir: &Path) -> Command {
     isolate_cmd(&mut cmd);
     cmd
 }
+
+/// Run GitMeta with PATH restricted to the caller's empty directory.
+pub(crate) fn git_meta_without_git(dir: &Path, empty_path: &Path) -> Command {
+    let mut cmd = git_meta(dir);
+    cmd.env("PATH", empty_path);
+    cmd
+}
+
 /// Get a writable copy of the `tests/fixtures/{name}.sh` fixture.
 ///
 /// Returns `(TempDir, initial_commit_sha)`. The `TempDir` owns the working

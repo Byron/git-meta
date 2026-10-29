@@ -15,6 +15,7 @@ mod import_gh;
 mod list;
 mod log;
 mod materialize;
+mod native;
 mod promisor;
 mod push_pull;
 mod remote;

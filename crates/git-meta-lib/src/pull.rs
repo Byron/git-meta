@@ -73,7 +73,12 @@ pub fn run(session: &Session, remote: Option<&str>, now: i64) -> Result<PullOutp
         .and_then(|r| r.into_fully_peeled_id().ok());
 
     // Fetch latest remote metadata
-    git_utils::run_git(repo, &["fetch", &remote_name, &fetch_refspec])?;
+    git_utils::fetch(
+        repo,
+        &remote_name,
+        [&fetch_refspec],
+        gix::remote::fetch::Shallow::NoChange,
+    )?;
 
     // Get the new tip
     let new_tip = repo

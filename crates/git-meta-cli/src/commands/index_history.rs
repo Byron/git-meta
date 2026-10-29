@@ -162,9 +162,7 @@ fn tracking_tip(ctx: &CommandContext) -> Option<gix::ObjectId> {
 
 fn total_commits(ctx: &CommandContext) -> Option<usize> {
     let tracking_ref = format!("refs/{}/remotes/main", ctx.session.namespace());
-    git_meta_lib::git_utils::run_git(ctx.session.repo(), &["rev-list", "--count", &tracking_ref])
-        .ok()
-        .and_then(|out| out.trim().parse().ok())
+    git_meta_lib::git_utils::count_commits(ctx.session.repo(), &tracking_ref).ok()
 }
 
 fn now_ms() -> i64 {

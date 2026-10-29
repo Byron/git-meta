@@ -13,6 +13,10 @@ pub enum Error {
     #[error("git error: {0}")]
     Git(#[from] Box<dyn std::error::Error + Send + Sync>),
 
+    /// Gitoxide operation failed, retaining its error chain and classifications.
+    #[error(transparent)]
+    Gix(#[from] gix::Error),
+
     /// JSON serialization or deserialization failed.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
