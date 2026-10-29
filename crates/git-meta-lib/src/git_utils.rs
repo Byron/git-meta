@@ -106,7 +106,7 @@ pub fn fetch(
     Ok(())
 }
 
-/// Push one explicit reference update, retaining typed rejection reasons.
+/// Push an explicit reference update to every push URL, retaining typed rejection reasons.
 ///
 /// # Errors
 /// Returns transport, configuration, and hook errors. Reference rejections are
@@ -120,73 +120,96 @@ pub fn push(repo: &gix::Repository, remote_name: &str, refspec: &str) -> Result<
     let update = gix::push::Update::from_refspec(repo, spec)?;
     let source_name = spec
         .source()
-        .map(|source| source.to_string())
-        .unwrap_or_else(|| "(delete)".into());
-    let hook = |updates: &[gix::push::UpdateOutcome]| -> gix::Result<()> {
-        let mut input = String::new();
-        for outcome in updates
-            .iter()
-            .filter(|outcome| matches!(outcome.status, gix::push::Status::WouldUpdate { .. }))
-        {
-            let null = repo.object_hash().null();
-            let new_id = outcome.update.new_id.unwrap_or(null);
-            let old_id = outcome.old_id.unwrap_or(null);
-            let local_ref = if outcome.update.destination == update.destination {
-                source_name.clone()
-            } else {
-                outcome.update.destination.as_bstr().to_string()
+        .map_or_else(|| "(delete)".into(), ToString::to_string);
+    let mut result = None;
+    for url in remote.urls(gix::remote::Direction::Push) {
+        let remote = remote
+            .clone()
+            .with_push_url_without_url_rewrite(url.clone())?;
+        let destination_result = (|| -> Result<gix::push::Status> {
+            let hook = |updates: &[gix::push::UpdateOutcome]| -> gix::Result<()> {
+                let mut input = String::new();
+                for outcome in updates.iter().filter(|outcome| {
+                    matches!(outcome.status, gix::push::Status::WouldUpdate { .. })
+                }) {
+                    let null = repo.object_hash().null();
+                    let new_id = outcome.update.new_id.unwrap_or(null);
+                    let old_id = outcome.old_id.unwrap_or(null);
+                    let local_ref = if outcome.update.destination == update.destination {
+                        source_name.clone()
+                    } else {
+                        outcome.update.destination.as_bstr().to_string()
+                    };
+                    use std::fmt::Write;
+                    writeln!(
+                        input,
+                        "{local_ref} {new_id} {} {old_id}",
+                        outcome.update.destination.as_bstr()
+                    )
+                    .or_error()?;
+                }
+                let url = remote
+                    .url(gix::remote::Direction::Push)
+                    .ok_or_else(|| gix::error::message("push URL is missing").raise())?;
+                let url = url.to_bstring();
+                let url = gix::path::from_bstr(&url)?;
+                let args = [std::ffi::OsStr::new(remote_name), url.as_os_str()];
+                for output in repo.run_hook_event_serially(
+                    "pre-push",
+                    gix::hook::Options {
+                        arguments: &args,
+                        stdin: Some(input.as_bytes()),
+                        ..Default::default()
+                    },
+                )? {
+                    use std::io::Write;
+                    std::io::stderr().write_all(&output.stderr).or_error()?;
+                    std::io::stdout().write_all(&output.stdout).or_error()?;
+                    if !output.status.success() {
+                        return Err(
+                            gix::error::message("pre-push hook rejected metadata push").raise()
+                        );
+                    }
+                }
+                Ok(())
             };
-            use std::fmt::Write;
-            writeln!(
-                input,
-                "{local_ref} {new_id} {} {old_id}",
-                outcome.update.destination.as_bstr()
-            )
-            .or_error()?;
-        }
-        let url = remote
-            .url(gix::remote::Direction::Push)
-            .ok_or_else(|| gix::error::message("push URL is missing").raise())?;
-        let url = url.to_bstring();
-        let url = gix::path::from_bstr(&url)?;
-        let args = [std::ffi::OsStr::new(remote_name), url.as_os_str()];
-        for output in repo.run_hook_event_serially(
-            "pre-push",
-            gix::hook::Options {
-                arguments: &args,
-                stdin: Some(input.as_bytes()),
-                ..Default::default()
-            },
-        )? {
-            use std::io::Write;
-            std::io::stderr().write_all(&output.stderr).or_error()?;
-            std::io::stdout().write_all(&output.stdout).or_error()?;
-            if !output.status.success() {
-                return Err(gix::error::message("pre-push hook rejected metadata push").raise());
+            let outcome = remote.push(
+                [update.clone()],
+                gix::push::Options {
+                    pre_push_hook: Some(&hook),
+                    ..Default::default()
+                },
+                gix::progress::Discard,
+                |_, bytes| {
+                    use std::io::Write;
+                    std::io::stderr().write_all(bytes)
+                },
+                &std::sync::atomic::AtomicBool::default(),
+            )?;
+            remote.update_tracking_refs(&outcome)?;
+            let mut updates = outcome.updates.into_iter();
+            let status = updates
+                .next()
+                .ok_or_else(|| Error::Other("metadata push returned no update status".into()))?
+                .status;
+            for derived in updates {
+                if let gix::push::Status::Rejected(reason) = derived.status {
+                    return Err(Error::Other(format!(
+                        "push of {} rejected: {reason:?}",
+                        derived.update.destination.as_bstr()
+                    )));
+                }
             }
-        }
-        Ok(())
-    };
-    let outcome = remote.push(
-        [update.clone()],
-        gix::push::Options {
-            pre_push_hook: Some(&hook),
-            ..Default::default()
-        },
-        gix::progress::Discard,
-        |_, bytes| {
-            use std::io::Write;
-            std::io::stderr().write_all(bytes)
-        },
-        &std::sync::atomic::AtomicBool::default(),
-    )?;
-    remote.update_tracking_refs(&outcome)?;
-    outcome
-        .updates
-        .into_iter()
-        .next()
-        .map(|update| update.status)
-        .ok_or_else(|| Error::Other("metadata push returned no update status".into()))
+            Ok(status)
+        })();
+        result = Some(match (result, destination_result) {
+            (Some(Err(error)), _) | (_, Err(error)) => Err(error),
+            (Some(Ok(status @ gix::push::Status::Rejected(_))), _)
+            | (Some(Ok(status)), Ok(gix::push::Status::UpToDate))
+            | (_, Ok(status)) => Ok(status),
+        });
+    }
+    result.unwrap_or_else(|| Err(Error::Other("push URL is missing".into())))
 }
 
 /// List all git remotes that have `meta = true` in their config.

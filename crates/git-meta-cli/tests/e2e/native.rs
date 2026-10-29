@@ -120,3 +120,67 @@ fn readme_publication_does_not_replace_an_existing_branch_without_git_on_path() 
         before
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn every_push_url_is_attempted_and_hook_failures_are_reported_without_git_on_path() {
+    use std::os::unix::fs::PermissionsExt;
+    for reject_first in [false, true] {
+        let (client, _) = setup_repo();
+        let first = tempfile::TempDir::new().unwrap();
+        let second = tempfile::TempDir::new().unwrap();
+        for remote in [&first, &second] {
+            gix::init_bare(remote.path()).unwrap();
+        }
+        let empty_path = tempfile::TempDir::new().unwrap();
+        harness::git_meta_without_git(client.path(), empty_path.path())
+            .args(["remote", "add", first.path().to_str().unwrap(), "--init"])
+            .assert()
+            .success();
+        let before =
+            harness::ref_to_commit_oid(&harness::open_repo(first.path()), "refs/meta/main");
+        harness::git_meta_without_git(client.path(), empty_path.path())
+            .args(["set", "project", "mirrors", "both"])
+            .assert()
+            .success();
+        if reject_first {
+            let hook = client.path().join(".git/hooks/pre-push");
+            std::fs::write(
+                &hook,
+                format!(
+                    "#!/bin/sh\n[ \"$1\" = meta ] || exit 2\n[ \"$2\" != '{}' ]\n",
+                    first.path().display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut command = harness::git_meta_without_git(client.path(), empty_path.path());
+        command
+            .env("GIT_CONFIG_COUNT", "5")
+            .env("GIT_CONFIG_KEY_3", "remote.meta.pushurl")
+            .env("GIT_CONFIG_VALUE_3", first.path())
+            .env("GIT_CONFIG_KEY_4", "remote.meta.pushurl")
+            .env("GIT_CONFIG_VALUE_4", second.path())
+            .arg("push");
+        if reject_first {
+            command
+                .assert()
+                .failure()
+                .stderr(predicate::str::contains("pre-push hook rejected"));
+        } else {
+            command.assert().success();
+        }
+        let published =
+            harness::ref_to_commit_oid(&harness::open_repo(second.path()), "refs/meta/main");
+        assert_ne!(
+            published, before,
+            "later destinations must be attempted even if an earlier hook fails"
+        );
+        assert_eq!(
+            harness::ref_to_commit_oid(&harness::open_repo(first.path()), "refs/meta/main"),
+            if reject_first { before } else { published },
+            "each sender hook receives its own destination URL"
+        );
+    }
+}
