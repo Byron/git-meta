@@ -184,3 +184,187 @@ fn every_push_url_is_attempted_and_hook_failures_are_reported_without_git_on_pat
         );
     }
 }
+
+#[test]
+fn tip_hydration_includes_symlink_blobs() {
+    let source_dir = tempfile::TempDir::new().unwrap();
+    let source = gix::init_bare(source_dir.path()).unwrap();
+    let blob_id = source.write_blob(b"symlink target").unwrap().detach();
+    let tree = gix::objs::Tree {
+        entries: vec![gix::objs::tree::Entry {
+            mode: gix::objs::tree::EntryKind::Link.into(),
+            filename: "link".into(),
+            oid: blob_id,
+        }],
+    };
+    let tree_id = source.write_object(&tree).unwrap().detach();
+    source
+        .reference(
+            "refs/meta/main",
+            tree_id,
+            gix::refs::transaction::PreviousValue::Any,
+            "fixture",
+        )
+        .unwrap();
+    let client_dir = tempfile::TempDir::new().unwrap();
+    gix::init_bare(client_dir.path()).unwrap();
+    let client = gix::open_opts(
+        client_dir.path(),
+        gix::open::Options::isolated().config_overrides([
+            format!("remote.meta.url={}", source_dir.path().display()),
+            "remote.meta.partialclonefilter=blob:none".into(),
+        ]),
+    )
+    .unwrap();
+    git_meta_lib::git_utils::fetch(
+        &client,
+        "meta",
+        ["refs/meta/main:refs/meta/remotes/main"],
+        gix::remote::fetch::Shallow::NoChange,
+    )
+    .unwrap();
+    assert!(
+        !client.has_object(blob_id),
+        "blobless fetch omits the symlink contents"
+    );
+    let count = git_meta_lib::git_utils::hydrate_tip_blobs_counted(
+        &client,
+        "meta",
+        "refs/meta/remotes/main",
+    )
+    .unwrap();
+    assert_eq!(
+        count, 1,
+        "a symlink stores blob content that must be hydrated"
+    );
+    assert_eq!(client.find_blob(blob_id).unwrap().data, b"symlink target");
+}
+
+#[test]
+fn pull_accepts_rewritten_metadata_history_without_git_on_path() {
+    for readd_remote in [false, true] {
+        let (client, _) = setup_repo();
+        let remote = setup_bare_with_history();
+        let remote_repo = harness::open_repo(remote.path());
+        let initial_id = harness::ref_to_commit_oid(&remote_repo, "refs/meta/main");
+        let mut initial = remote_repo
+            .find_commit(initial_id)
+            .unwrap()
+            .decode()
+            .unwrap()
+            .to_owned()
+            .unwrap();
+        let mut base = remote_repo
+            .find_commit(initial.parents[0])
+            .unwrap()
+            .decode()
+            .unwrap()
+            .to_owned()
+            .unwrap();
+        let older_blob = remote_repo
+            .write_blob(b"older value outside the merge base")
+            .unwrap()
+            .detach();
+        let mut older_tree = remote_repo.empty_tree().edit().unwrap();
+        older_tree
+            .upsert(
+                "project/older/__value",
+                gix::objs::tree::EntryKind::Blob,
+                older_blob,
+            )
+            .unwrap();
+        let mut older = base.clone();
+        older.tree = older_tree.write().unwrap().detach();
+        older.message = "older history".into();
+        base.parents = vec![remote_repo.write_object(&older).unwrap().detach()].into();
+        initial.parents = vec![remote_repo.write_object(&base).unwrap().detach()].into();
+        let initial_id = remote_repo.write_object(&initial).unwrap().detach();
+        remote_repo
+            .reference(
+                "refs/meta/main",
+                initial_id,
+                gix::refs::transaction::PreviousValue::Any,
+                "extend fixture history",
+            )
+            .unwrap();
+        let empty_path = tempfile::TempDir::new().unwrap();
+        harness::git_meta_without_git(client.path(), empty_path.path())
+            .args(["remote", "add", remote.path().to_str().unwrap()])
+            .assert()
+            .success();
+        let original = harness::ref_to_commit_oid(&remote_repo, "refs/meta/main");
+        let mut rewritten = remote_repo
+            .find_commit(original)
+            .unwrap()
+            .decode()
+            .unwrap()
+            .to_owned()
+            .unwrap();
+        rewritten.message = "rewritten metadata tip".into();
+        let rewritten_id = remote_repo.write_object(&rewritten).unwrap().detach();
+        remote_repo
+            .reference(
+                "refs/meta/main",
+                rewritten_id,
+                gix::refs::transaction::PreviousValue::MustExistAndMatch(original.into()),
+                "rewrite remote",
+            )
+            .unwrap();
+        let client_repo = harness::open_repo(client.path());
+        let base_blob = remote_repo
+            .find_tree(base.tree)
+            .unwrap()
+            .lookup_entry_by_path("project/old_key/__value")
+            .unwrap()
+            .unwrap()
+            .object_id();
+        assert!(
+            !client_repo.has_object(base_blob),
+            "the future merge base starts blobless"
+        );
+        if readd_remote {
+            harness::git_meta_without_git(client.path(), empty_path.path())
+                .args(["remote", "remove", "meta"])
+                .assert()
+                .success();
+            client_repo
+                .reference(
+                    "refs/meta/local/main",
+                    original,
+                    gix::refs::transaction::PreviousValue::Any,
+                    "preserve existing local metadata before setup",
+                )
+                .unwrap();
+            harness::git_meta_without_git(client.path(), empty_path.path())
+                .args(["remote", "add", remote.path().to_str().unwrap()])
+                .assert()
+                .success();
+        } else {
+            harness::git_meta_without_git(client.path(), empty_path.path())
+                .arg("pull")
+                .assert()
+                .success();
+        }
+        assert_eq!(
+            harness::ref_to_commit_oid(
+                &harness::open_repo(client.path()),
+                "refs/meta/remotes/main"
+            ),
+            rewritten_id,
+            "metadata refs outside heads/tags accept rewritten history like Git fetch"
+        );
+        assert!(
+            client_repo.has_object(base_blob),
+            "three-way materialization hydrates its common ancestor"
+        );
+        assert!(
+            !client_repo.has_object(older_blob),
+            "older history outside the merge base remains promised"
+        );
+        harness::git_meta_without_git(client.path(), empty_path.path())
+            .args(["get", "project", "testing"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("hello"));
+    }
+}

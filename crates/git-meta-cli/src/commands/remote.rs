@@ -460,7 +460,7 @@ pub(crate) fn run_add(
     } else {
         format!("refs/{ns}/remotes/main")
     };
-    let fetch_refspec = format!("refs/{ns}/main:{tracking_ref}");
+    let fetch_refspec = format!("+refs/{ns}/main:{tracking_ref}");
     let depth_arg = depth.map(|depth| format!("--depth={depth}"));
     match depth_arg.as_deref() {
         Some(_) => eprint!(
@@ -529,6 +529,14 @@ pub(crate) fn run_add(
             let _ = ctx.session.serialize()?;
             eprintln!(" {}", s_err.ok(&format!("done in {}.", elapsed(started))));
 
+            if !side_ref {
+                git_meta_lib::git_utils::hydrate_merge_base_blobs(
+                    repo,
+                    name,
+                    &format!("refs/{ns}/local/main"),
+                    &tracking_ref,
+                )?;
+            }
             eprint!("{} remote metadata...", s_err.step("Materializing"));
             let started = std::time::Instant::now();
             materialize::run(None, false, false, false)?;

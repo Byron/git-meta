@@ -284,7 +284,7 @@ pub fn resolve_push_conflict_with_progress(
     let remote_tracking_ref = format!("refs/{ns}/remotes/main");
 
     // Fetch latest remote data
-    let fetch_refspec = format!("{remote_refspec}:{remote_tracking_ref}");
+    let fetch_refspec = format!("+{remote_refspec}:{remote_tracking_ref}");
     progress(PushProgress::FetchingRemote {
         remote_name: remote_name.clone(),
         remote_ref: remote_refspec,
@@ -300,6 +300,8 @@ pub fn resolve_push_conflict_with_progress(
     let short_ref = format!("{ns}/remotes/main");
     progress(PushProgress::HydratingRemoteTip);
     git_utils::hydrate_tip_blobs(repo, &remote_name, &short_ref)?;
+
+    git_utils::hydrate_merge_base_blobs(repo, &remote_name, &local_ref, &remote_tracking_ref)?;
 
     // Materialize the remote data (merge into local DB)
     progress(PushProgress::MaterializingRemote);

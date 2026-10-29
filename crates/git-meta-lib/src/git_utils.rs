@@ -285,12 +285,37 @@ pub fn hydrate_tip_blobs_counted(
     let entries = tree.traverse().breadthfirst.files()?;
     let oids: Vec<_> = entries
         .into_iter()
-        .filter(|entry| entry.mode.is_blob())
+        .filter(|entry| entry.mode.is_blob_or_symlink())
         .map(|entry| entry.oid)
         .collect();
     let count = oids.len();
     fetch_blob_oids(repo, remote_name, &oids)?;
     Ok(count)
+}
+
+/// Hydrate the common ancestor tree that metadata materialization reads for a three-way merge.
+///
+/// Resolve the current local and remote refs so synchronization can prepare the exact
+/// base used by materialization. No local ref or no common ancestor needs no fetch.
+/// Already present blobs are skipped; older history remains lazy.
+///
+/// # Errors
+/// Returns an error if refs, the merge base, or its objects cannot be read or fetched.
+pub fn hydrate_merge_base_blobs(
+    repo: &gix::Repository,
+    remote_name: &str,
+    local_ref: &str,
+    remote_ref: &str,
+) -> Result<()> {
+    let Some(local) = repo.try_find_reference(local_ref)? else {
+        return Ok(());
+    };
+    let local = local.into_fully_peeled_id()?;
+    let remote = repo.find_reference(remote_ref)?.into_fully_peeled_id()?;
+    if let Some(base) = repo.merge_base(local, remote)? {
+        hydrate_tip_blobs(repo, remote_name, &base.to_string())?;
+    }
+    Ok(())
 }
 
 /// Look up a blob OID in a git tree by following a slash-separated path.

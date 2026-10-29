@@ -62,7 +62,9 @@ pub struct MaterializeOutput {
 ///
 /// For each matching remote ref, determines the merge strategy and
 /// applies changes to the database. Updates tracking refs and the
-/// materialization timestamp.
+/// materialization timestamp. This operation stays offline: remote, local, and
+/// merge-base trees must already be readable, including their blob contents.
+/// Synchronization hydrates the required trees before calling it.
 ///
 /// # Parameters
 ///

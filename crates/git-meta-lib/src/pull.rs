@@ -64,7 +64,7 @@ pub fn run(session: &Session, remote: Option<&str>, now: i64) -> Result<PullOutp
     } else {
         format!("refs/{ns}/remotes/main")
     };
-    let fetch_refspec = format!("{remote_refspec}:{tracking_ref}");
+    let fetch_refspec = format!("+{remote_refspec}:{tracking_ref}");
 
     // Record the old tip so we can count new commits
     let old_tip = repo
@@ -128,6 +128,8 @@ pub fn run(session: &Session, remote: Option<&str>, now: i64) -> Result<PullOutp
 
     // Serialize local state so materialize can do a proper 3-way merge
     let _ = crate::serialize::run(session, now, false)?;
+
+    git_utils::hydrate_merge_base_blobs(repo, &remote_name, &local_ref, &tracking_ref)?;
 
     // Materialize: merge remote tree into local DB
     let _ = crate::materialize::run(session, None, now)?;
