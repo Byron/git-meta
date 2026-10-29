@@ -134,6 +134,19 @@ fn blame_matches_git_without_git_on_path() {
 }
 
 #[test]
+fn blame_follows_staged_renames_without_git_on_path() {
+    let (repo, _) = writable_fixture("native-inspect.sh");
+    oracle(repo.path(), &["mv", "dir/renamed.txt", "dir/staged.txt"]);
+    assert_blame(repo.path(), "dir/staged.txt", None);
+    std::fs::write(
+        repo.path().join("dir/staged.txt"),
+        "completely different contents\n",
+    )
+    .unwrap();
+    assert_blame(repo.path(), "dir/staged.txt", None);
+}
+
+#[test]
 fn blame_rejects_missing_untracked_and_outside_paths_without_git() {
     let (repo, _) = writable_fixture("native-inspect.sh");
     let empty_path = tempfile::TempDir::new().unwrap();
@@ -210,4 +223,46 @@ fn show_matches_diff_tree_without_git_on_path() {
             assert_eq!(actual, expected, "{revision}, core.quotePath={quote_path}");
         }
     }
+}
+
+#[test]
+fn inspection_rejects_invalid_path_quoting_configuration() {
+    let (repo, _) = writable_fixture("native-inspect.sh");
+    oracle(repo.path(), &["config", "core.quotePath", "invalid"]);
+    let empty_path = tempfile::TempDir::new().unwrap();
+    for args in [vec!["show", "HEAD"], vec!["blame", "dir/renamed.txt"]] {
+        git_meta_without_git(repo.path(), empty_path.path())
+            .args(args)
+            .assert()
+            .failure();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn staged_rename_and_textconv_match_git_without_git_on_path() {
+    use std::os::unix::fs::PermissionsExt;
+    let (repo, _) = writable_fixture("native-inspect.sh");
+    std::fs::write(
+        repo.path().join(".gitattributes"),
+        "*.txt diff=inspection\n",
+    )
+    .unwrap();
+    let converter = repo.path().join("inspection-converter");
+    std::fs::write(
+        &converter,
+        "#!/bin/sh\nwhile IFS= read -r line; do printf '%s converted\\n' \"$line\"; done < \"$1\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&converter, std::fs::Permissions::from_mode(0o755)).unwrap();
+    oracle(
+        repo.path(),
+        &[
+            "config",
+            "diff.inspection.textconv",
+            "./inspection-converter",
+        ],
+    );
+    oracle(repo.path(), &["mv", "dir/renamed.txt", "dir/staged.txt"]);
+    assert_blame(repo.path(), "dir/staged.txt", None);
 }

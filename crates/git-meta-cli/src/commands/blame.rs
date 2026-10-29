@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::io::{Read, Write};
+use std::io::Write;
 
 use gix::bstr::ByteSlice;
 
@@ -71,64 +71,22 @@ fn blame_lines(
     rev: Option<&str>,
     now: i64,
 ) -> Result<Vec<BlameLine>> {
-    let path = repo.normalize_path(path)?;
-    let mut contents_mode = None;
-    let start = if let Some(rev) = rev {
-        gix::blame::Start::Commit(repo.rev_parse_single(rev)?.object()?.peel_to_commit()?.id)
-    } else {
-        let first_suspect = repo.head_id()?.detach();
-        let (mut filters, index) = repo.filter_pipeline(None)?;
-        if index.entry_by_path(&path).is_none()
-            && repo
-                .head_tree()?
-                .lookup_entry_by_path(gix::path::from_bstr(path.as_ref())?)?
-                .is_none()
-        {
-            bail!("path {path} is not tracked");
-        }
-        let worktree_path = repo
-            .workdir_path(path.as_ref())
-            .context("blame without a revision requires a worktree")?;
-        let metadata = std::fs::symlink_metadata(&worktree_path)
-            .with_context(|| format!("could not read {path}"))?;
-        contents_mode = Some(if metadata.file_type().is_symlink() {
-            gix::objs::tree::EntryKind::Link
-        } else {
-            gix::objs::tree::EntryKind::Blob
-        });
-        let contents = if metadata.file_type().is_symlink() {
-            gix::path::into_bstr(std::fs::read_link(worktree_path)?)?
-                .into_owned()
-                .into()
-        } else {
-            let mut contents = Vec::new();
-            filters
-                .convert_to_git(
-                    std::fs::File::open(worktree_path)?,
-                    &gix::path::from_bstr(path.as_ref())?,
-                    &index,
-                )?
-                .read_to_end(&mut contents)?;
-            contents
-        };
-        gix::blame::Start::Contents {
-            first_suspect,
-            contents: contents.into(),
-        }
+    let normalized_path = repo.normalize_path(path)?;
+    let options = gix::repository::blame_file::Options {
+        rewrites: Some(Default::default()),
+        textconv: true,
+        ..Default::default()
     };
-    let outcome = repo.blame_file_from(
-        &path,
-        start,
-        gix::repository::blame_file::Options {
-            rewrites: Some(Default::default()),
-            contents_mode,
-            ..Default::default()
-        },
-    )?;
+    let outcome = if let Some(rev) = rev {
+        let commit = repo.rev_parse_single(rev)?.object()?.peel_to_commit()?;
+        repo.blame_file(&normalized_path, commit.id, options)?
+    } else {
+        repo.blame_worktree_file(path.as_bytes().as_bstr(), options)?
+    };
     let mailmap = repo.open_mailmap();
     let quote_high_bytes = repo
         .config_snapshot()
-        .boolean("core.quotePath")
+        .try_boolean("core.quotePath")?
         .unwrap_or(true);
     let mut lines = Vec::new();
     for (entry, source_lines) in outcome.entries_with_lines() {
@@ -136,7 +94,7 @@ fn blame_lines(
             (
                 "Not Committed Yet".to_string(),
                 now.to_string(),
-                format!("Version of {path} from {path}"),
+                format!("Version of {normalized_path} from {normalized_path}"),
             )
         } else {
             let commit = repo.find_commit(entry.commit_id)?;

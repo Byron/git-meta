@@ -127,7 +127,7 @@ pub(crate) fn run(commit_ref: &str) -> Result<()> {
             println!("{BOLD}Files changed:{RESET}");
             let quote_high_bytes = repo
                 .config_snapshot()
-                .boolean("core.quotePath")
+                .try_boolean("core.quotePath")?
                 .unwrap_or(true);
             for (path, status) in files {
                 let path = gix::quote::ansi_c::quote_with(path.as_bstr(), quote_high_bytes);
