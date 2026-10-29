@@ -86,34 +86,57 @@ pub(crate) fn run(commit_ref: &str) -> Result<()> {
         println!("{line}");
     }
 
-    // Show diff stats using git subprocess (gix diff API is complex, this is simpler)
-    let git_dir = repo.path();
-    let diff_output = Command::new("git")
-        .args(["--git-dir", &git_dir.to_string_lossy()])
-        .args(["diff-tree", "--no-commit-id", "-r", "--name-status", &sha])
-        .output()
-        .ok();
-
-    if let Some(output) = diff_output {
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let lines: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
-            if !lines.is_empty() {
-                println!();
-                println!("{BOLD}Files changed:{RESET}");
-                for line in &lines {
-                    let parts: Vec<&str> = line.splitn(2, '\t').collect();
-                    if parts.len() == 2 {
-                        let status_char = parts[0].chars().next().unwrap_or('?');
-                        let path = parts[1];
-                        let status_color = match status_char {
-                            'A' => GREEN,
-                            'D' => "\x1b[31m", // red
-                            _ => YELLOW,
-                        };
-                        println!("  {status_color}{status_char}{RESET} {path}");
-                    }
+    // Like diff-tree without --root or -m, only show a single-parent commit's changes.
+    if let [parent] = decoded.parents().collect::<Vec<_>>().as_slice() {
+        use gix::object::tree::diff::ChangeDetached;
+        let parent_tree = repo.find_commit(*parent)?.tree()?;
+        let tree = commit_obj.tree()?;
+        let changes = repo.diff_tree_to_tree(&parent_tree, &tree, gix::diff::Options::default())?;
+        let mut files = Vec::new();
+        for change in changes {
+            let (status, path, mode) = match change {
+                ChangeDetached::Addition {
+                    location,
+                    entry_mode,
+                    ..
+                } => ('A', location, entry_mode),
+                ChangeDetached::Deletion {
+                    location,
+                    entry_mode,
+                    ..
+                } => ('D', location, entry_mode),
+                ChangeDetached::Modification {
+                    location,
+                    previous_entry_mode,
+                    entry_mode,
+                    ..
+                } => {
+                    let same_type = previous_entry_mode.kind() == entry_mode.kind()
+                        || (previous_entry_mode.is_blob() && entry_mode.is_blob());
+                    (if same_type { 'M' } else { 'T' }, location, entry_mode)
                 }
+                ChangeDetached::Rewrite { .. } => unreachable!("rewrite tracking is disabled"),
+            };
+            if !mode.is_tree() {
+                files.push((path, status));
+            }
+        }
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        if !files.is_empty() {
+            println!();
+            println!("{BOLD}Files changed:{RESET}");
+            let quote_high_bytes = repo
+                .config_snapshot()
+                .try_boolean("core.quotePath")?
+                .unwrap_or(true);
+            for (path, status) in files {
+                let path = gix::quote::ansi_c::quote_with(path.as_bstr(), quote_high_bytes);
+                let status_color = match status {
+                    'A' => GREEN,
+                    'D' => "\x1b[31m",
+                    _ => YELLOW,
+                };
+                println!("  {status_color}{status}{RESET} {path}");
             }
         }
     }

@@ -8,7 +8,7 @@ pub(crate) fn run(remote: Option<&str>, verbose: bool) -> Result<()> {
     if verbose {
         let ns = ctx.session.namespace();
         let remote_name = ctx.session.resolve_remote(remote)?;
-        let fetch_refspec = format!("refs/{ns}/main:refs/{ns}/remotes/main");
+        let fetch_refspec = format!("+refs/{ns}/main:refs/{ns}/remotes/main");
         eprintln!("[verbose] remote: {remote_name}");
         eprintln!("[verbose] fetch refspec: {fetch_refspec}");
     }

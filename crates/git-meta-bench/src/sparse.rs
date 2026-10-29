@@ -66,7 +66,7 @@ pub(crate) struct ConsumerPhases {
     pub hydrated_blobs: usize,
     /// Pack files present after hydration, before any repack.
     pub packs_after_hydrate: usize,
-    /// Repacking those into one pack so the object database can be opened.
+    /// Compacting retained objects while the existing object database stays open.
     pub repack_ms: u128,
     /// Rebuilding the local SQLite store from the fetched tree.
     pub materialize_ms: u128,
@@ -132,7 +132,6 @@ fn clone_consumer(
     consumer_dir: &Path,
     namespace: &str,
     blobless: bool,
-    prefetch_filtered: bool,
 ) -> Result<u128> {
     let parent = consumer_dir
         .parent()
@@ -188,22 +187,6 @@ fn clone_consumer(
         git(
             consumer_dir,
             &["config", "extensions.partialClone", "origin"],
-        )?;
-    }
-
-    if prefetch_filtered {
-        // Fetch the metadata ref with the blob filter applied. `Session::pull`
-        // fetches the same refspec without a filter, so doing it here first is
-        // the only way to get a genuinely blobless metadata history — pull then
-        // finds the tracking ref already current and fetches nothing more.
-        git(
-            consumer_dir,
-            &[
-                "fetch",
-                "--filter=blob:none",
-                "origin",
-                &format!("+refs/{namespace}/main:refs/{namespace}/remotes/main"),
-            ],
         )?;
     }
 
@@ -269,18 +252,16 @@ fn measure_phases(
     blobless: bool,
     clone_ms: u128,
 ) -> Result<ConsumerPhases> {
-    clone_consumer(origin_dir, consumer_dir, namespace, blobless, false)?;
+    clone_consumer(origin_dir, consumer_dir, namespace, blobless)?;
+    let session = Session::open(consumer_dir)?;
     let tracking_ref = format!("refs/{namespace}/remotes/main");
 
     let started = std::time::Instant::now();
-    git(
-        consumer_dir,
-        &[
-            "fetch",
-            "--quiet",
-            "origin",
-            &format!("+refs/{namespace}/main:{tracking_ref}"),
-        ],
+    git_utils::fetch(
+        session.repo(),
+        "origin",
+        [format!("+refs/{namespace}/main:{tracking_ref}")],
+        gix::remote::fetch::Shallow::NoChange,
     )?;
     let fetch_meta_ms = started.elapsed().as_millis();
 
@@ -289,26 +270,16 @@ fn measure_phases(
         .unwrap_or(&tracking_ref)
         .to_string();
     let started = std::time::Instant::now();
-    let hydrated_blobs = {
-        // Scope the session: hydration runs `git fetch` in batches, and each
-        // batch lands a new pack. gix sizes its object-database slot map when
-        // the repository is opened, so a handle opened before hydration cannot
-        // see what hydration adds.
-        let session = Session::open(consumer_dir)?;
-        git_utils::hydrate_tip_blobs_counted(session.repo(), "origin", &short_ref)?
-    };
+    let hydrated_blobs =
+        git_utils::hydrate_tip_blobs_counted(session.repo(), "origin", &short_ref)?;
     let hydrate_tip_ms = started.elapsed().as_millis();
     let packs_after_hydrate = count_packs(consumer_dir);
 
-    // Collapse those packs into one. Without this, opening the repository fails
-    // outright once hydration has produced more packs than the slot map holds
-    // ("The slotmap turned out to be too small"), so this is not tuning — it is
-    // what makes the rest of the work possible at all.
     let started = std::time::Instant::now();
-    git(consumer_dir, &["repack", "-a", "-d", "-q"])?;
+    session
+        .repo()
+        .repack_objects(&std::sync::atomic::AtomicBool::default())?;
     let repack_ms = started.elapsed().as_millis();
-
-    let session = Session::open(consumer_dir)?;
 
     // `materialize` takes a ref-namespace segment, not a remote name: passing
     // the remote name matches `refs/{ns}/origin*` and silently finds nothing.
@@ -422,22 +393,11 @@ pub(crate) fn run(
 ) -> Result<Vec<CloneResult>> {
     let mut results = Vec::new();
 
-    let arms = [
-        // What a consumer gets today.
-        ("full clone", false, false),
-        // What the blobless-clone documentation suggests doing.
-        ("blobless clone", true, false),
-    ];
+    let arms = [("full clone", false), ("blobless clone", true)];
 
-    for (label, blobless, prefetch_filtered) in arms {
+    for (label, blobless) in arms {
         let consumer_dir: PathBuf = workspace.join(label.replace(' ', "-"));
-        let clone_ms = clone_consumer(
-            origin_dir,
-            &consumer_dir,
-            namespace,
-            blobless,
-            prefetch_filtered,
-        )?;
+        let clone_ms = clone_consumer(origin_dir, &consumer_dir, namespace, blobless)?;
         let clone_bytes =
             crate::support::dir_size(&crate::support::git_dir(&consumer_dir).join("objects"));
 
@@ -506,7 +466,7 @@ pub(crate) fn run(
         results.push(CloneResult {
             label: label.to_string(),
             blobless,
-            filtered_meta_fetch: prefetch_filtered,
+            filtered_meta_fetch: blobless,
             missing_objects: count_missing_objects(&consumer_dir, &tracking_ref)?,
             phases,
             clone_ms,

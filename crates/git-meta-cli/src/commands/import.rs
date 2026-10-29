@@ -9,7 +9,6 @@ use serde_json::Value;
 
 use crate::context::CommandContext;
 use git_meta_lib::db::Store;
-use git_meta_lib::git_utils;
 use git_meta_lib::types::{Target, TargetType, ValueType, GIT_REF_THRESHOLD};
 use git_meta_lib::MetaValue;
 
@@ -755,23 +754,27 @@ fn import_release_tags(ctx: &CommandContext, dry_run: bool) -> Result<u64> {
 }
 
 fn release_tags(repo: &gix::Repository) -> Result<Vec<ReleaseTag>> {
-    let output = git_utils::run_git(
-        repo,
-        &[
-            "for-each-ref",
-            "--sort=creatordate",
-            "--format=%(refname:short)",
-            "refs/tags",
-        ],
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
-    Ok(output
-        .lines()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(|name| ReleaseTag {
-            name: name.to_string(),
-        })
+    let mut tags = Vec::new();
+    for reference in repo.references()?.prefixed("refs/tags/")? {
+        let mut reference = reference?;
+        let name = reference.name().shorten().to_string();
+        let object = reference.follow_to_object()?.object()?;
+        let timestamp = match object.kind {
+            gix::object::Kind::Tag => object
+                .into_tag()
+                .tagger()?
+                .map(|tagger| tagger.time())
+                .transpose()?
+                .map(|time| time.seconds),
+            gix::object::Kind::Commit => Some(object.into_commit().time()?.seconds),
+            _ => None,
+        };
+        tags.push((timestamp, name));
+    }
+    tags.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    Ok(tags
+        .into_iter()
+        .map(|(_, name)| ReleaseTag { name })
         .collect())
 }
 
@@ -780,18 +783,30 @@ fn commits_between_tags(
     previous: Option<&ReleaseTag>,
     tag: &ReleaseTag,
 ) -> Result<Vec<String>> {
-    let range = previous.map_or_else(
-        || tag.name.clone(),
-        |prev| format!("{}..{}", prev.name, tag.name),
-    );
-    let output = git_utils::run_git(repo, &["rev-list", "--reverse", &range])
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    Ok(output
-        .lines()
-        .map(str::trim)
-        .filter(|sha| !sha.is_empty())
-        .map(std::string::ToString::to_string)
-        .collect())
+    let tip = repo
+        .rev_parse_single(format!("refs/tags/{}", tag.name).as_bytes())?
+        .object()?
+        .peel_to_commit()?
+        .id;
+    let mut walk = repo
+        .rev_walk([tip])
+        .sorting(gix::revision::walk::Sorting::ByCommitTime(
+            gix::traverse::commit::simple::CommitTimeOrder::NewestFirst,
+        ));
+    if let Some(previous) = previous {
+        let hidden = repo
+            .rev_parse_single(format!("refs/tags/{}", previous.name).as_bytes())?
+            .object()?
+            .peel_to_commit()?
+            .id;
+        walk = walk.with_hidden([hidden]);
+    }
+    let mut commits = Vec::new();
+    for commit in walk.all()? {
+        commits.push(commit?.id().to_string());
+    }
+    commits.reverse();
+    Ok(commits)
 }
 
 fn apply_released_in(
@@ -2425,6 +2440,72 @@ fn parse_git_ai_note(text: &str) -> Result<GitAiNote> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_history_uses_tag_creation_order_and_excludes_previous_ancestors() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let repo = gix::init_bare(directory.path()).unwrap();
+        let signature = |seconds| gix::actor::Signature {
+            name: "Test".into(),
+            email: "test@example.com".into(),
+            time: gix::date::Time::new(seconds, 0),
+        };
+        let mut commit = gix::objs::Commit {
+            tree: repo.empty_tree().id,
+            parents: Default::default(),
+            author: signature(1_000),
+            committer: signature(1_000),
+            message: "root".into(),
+            encoding: None,
+            extra_headers: Default::default(),
+        };
+        let root = repo.write_object(&commit).unwrap().detach();
+        commit.parents.push(root);
+        commit.message = "next".into();
+        commit.committer = signature(2_000);
+        let next = repo.write_object(&commit).unwrap().detach();
+        for (name, target, seconds) in [("v-old", root, 4_000), ("v-new", next, 3_000)] {
+            let tag = gix::objs::Tag {
+                target,
+                target_kind: gix::object::Kind::Commit,
+                name: name.into(),
+                tagger: Some(signature(seconds)),
+                message: "release".into(),
+                signature: None,
+            };
+            let tag_id = repo.write_object(&tag).unwrap();
+            repo.reference(
+                format!("refs/tags/{name}"),
+                tag_id,
+                gix::refs::transaction::PreviousValue::MustNotExist,
+                "tag",
+            )
+            .unwrap();
+        }
+        repo.reference(
+            "refs/tags/light",
+            root,
+            gix::refs::transaction::PreviousValue::MustNotExist,
+            "tag",
+        )
+        .unwrap();
+        let tags = release_tags(&repo).unwrap();
+        assert_eq!(
+            tags.iter().map(|tag| tag.name.as_str()).collect::<Vec<_>>(),
+            ["light", "v-new", "v-old"],
+            "annotated tags use tagger dates, lightweight tags use commit dates"
+        );
+        assert_eq!(
+            commits_between_tags(&repo, Some(&tags[0]), &tags[1]).unwrap(),
+            [next.to_string()],
+            "already released ancestry is excluded"
+        );
+        assert_eq!(
+            commits_between_tags(&repo, None, &tags[1]).unwrap(),
+            [root.to_string(), next.to_string()],
+            "the initial range is oldest first"
+        );
+    }
 
     #[test]
     fn branch_id_sanitizes_path_separators() {

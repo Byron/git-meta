@@ -183,37 +183,28 @@ pub fn push_once_with_progress(
         local_ref,
         remote_ref: remote_refspec.clone(),
     });
-    let result = git_utils::run_git(repo, &["push", &remote_name, &push_refspec]);
+    let result = git_utils::push(repo, &remote_name, &push_refspec);
 
-    match result {
-        Ok(_) => Ok(PushOutput {
-            success: true,
-            non_fast_forward: false,
-            up_to_date: false,
-            remote_name,
-            remote_ref: remote_refspec,
-            commit_oid: commit_oid_str,
-        }),
-        Err(e) => {
-            let err_msg = e.to_string();
-            let is_non_ff = err_msg.contains("non-fast-forward")
-                || err_msg.contains("rejected")
-                || err_msg.contains("fetch first");
-
-            if is_non_ff {
-                Ok(PushOutput {
-                    success: false,
-                    non_fast_forward: true,
-                    up_to_date: false,
-                    remote_name,
-                    remote_ref: remote_refspec,
-                    commit_oid: commit_oid_str,
-                })
-            } else {
-                Err(Error::GitCommand(format!("push failed: {err_msg}")))
-            }
+    let status = result?;
+    let non_fast_forward = match &status {
+        gix::push::Status::Rejected(
+            gix::push::Rejection::NonFastForward
+            | gix::push::Rejection::FetchFirst
+            | gix::push::Rejection::NeedsForce,
+        ) => true,
+        gix::push::Status::Rejected(reason) => {
+            return Err(Error::Other(format!("push rejected: {reason:?}")))
         }
-    }
+        _ => false,
+    };
+    Ok(PushOutput {
+        success: !non_fast_forward,
+        non_fast_forward,
+        up_to_date: matches!(status, gix::push::Status::UpToDate),
+        remote_name,
+        remote_ref: remote_refspec,
+        commit_oid: commit_oid_str,
+    })
 }
 
 fn peeled_ref_oid(repo: &gix::Repository, ref_name: &str) -> Option<gix::ObjectId> {
@@ -293,17 +284,24 @@ pub fn resolve_push_conflict_with_progress(
     let remote_tracking_ref = format!("refs/{ns}/remotes/main");
 
     // Fetch latest remote data
-    let fetch_refspec = format!("{remote_refspec}:{remote_tracking_ref}");
+    let fetch_refspec = format!("+{remote_refspec}:{remote_tracking_ref}");
     progress(PushProgress::FetchingRemote {
         remote_name: remote_name.clone(),
         remote_ref: remote_refspec,
     });
-    git_utils::run_git(repo, &["fetch", &remote_name, &fetch_refspec])?;
+    git_utils::fetch(
+        repo,
+        &remote_name,
+        [&fetch_refspec],
+        gix::remote::fetch::Shallow::NoChange,
+    )?;
 
     // Hydrate tip tree blobs so gix can read them
     let short_ref = format!("{ns}/remotes/main");
     progress(PushProgress::HydratingRemoteTip);
     git_utils::hydrate_tip_blobs(repo, &remote_name, &short_ref)?;
+
+    git_utils::hydrate_merge_base_blobs(repo, &remote_name, &local_ref, &remote_tracking_ref)?;
 
     // Materialize the remote data (merge into local DB)
     progress(PushProgress::MaterializingRemote);

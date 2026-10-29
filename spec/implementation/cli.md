@@ -241,7 +241,7 @@ Behavior:
   `refs/<ns>/remotes/main`; if a primary metadata remote already exists,
   the new remote is marked with `remote.<name>.metaside = true` and
   fetches to `refs/<ns>/remotes/<name>/main`
-- inspects the remote with `git ls-remote` to check that
+- reads the remote's advertised references to check that
   `refs/<ns>/main` exists, and on success runs an initial blobless
   fetch and `materialize` so values are immediately readable
 - if no metadata refs are present on the remote:

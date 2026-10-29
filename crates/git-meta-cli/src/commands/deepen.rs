@@ -38,25 +38,16 @@ pub(crate) fn run(depth: Option<u32>) -> Result<()> {
 
     let before = count_commits(&ctx, &tracking_ref);
     let refspec = format!("+refs/{ns}/main:{tracking_ref}");
-    let deepen_arg = match depth {
-        Some(depth) => format!("--deepen={depth}"),
-        None => "--unshallow".to_string(),
-    };
     match depth {
         Some(depth) => eprint!("{} by {depth} commits...", s_err.step("Deepening")),
         None => eprint!("{} to the full history...", s_err.step("Deepening")),
     }
     let started = std::time::Instant::now();
-    git_meta_lib::git_utils::run_git(
-        repo,
-        &[
-            "fetch",
-            "--filter=blob:none",
-            &deepen_arg,
-            &remote,
-            &refspec,
-        ],
-    )?;
+    let shallow = depth.map_or_else(
+        gix::remote::fetch::Shallow::undo,
+        gix::remote::fetch::Shallow::Deepen,
+    );
+    git_meta_lib::git_utils::fetch(repo, &remote, [&refspec], shallow)?;
     let after = count_commits(&ctx, &tracking_ref);
     eprintln!(
         " {}",
@@ -102,18 +93,13 @@ pub(crate) fn run(depth: Option<u32>) -> Result<()> {
 ///
 /// An empty result means the history is complete.
 fn shallow_boundary(repo: &gix::Repository) -> Vec<gix::ObjectId> {
-    let Ok(contents) = std::fs::read_to_string(repo.git_dir().join("shallow")) else {
-        return Vec::new();
-    };
-    contents
-        .lines()
-        .filter_map(|line| gix::ObjectId::from_hex(line.trim().as_bytes()).ok())
-        .collect()
+    repo.shallow_commits()
+        .ok()
+        .flatten()
+        .map(|commits| commits.iter().copied().collect())
+        .unwrap_or_default()
 }
 
 fn count_commits(ctx: &CommandContext, tracking_ref: &str) -> usize {
-    git_meta_lib::git_utils::run_git(ctx.session.repo(), &["rev-list", "--count", tracking_ref])
-        .ok()
-        .and_then(|out| out.trim().parse().ok())
-        .unwrap_or(0)
+    git_meta_lib::git_utils::count_commits(ctx.session.repo(), tracking_ref).unwrap_or(0)
 }

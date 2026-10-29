@@ -30,18 +30,24 @@ fn check_remote_refs(
     url: &str,
     ns: &str,
 ) -> Result<(bool, Vec<String>)> {
-    let output = git_meta_lib::git_utils::run_git(session.repo(), &["ls-remote", url])?;
+    let remote = session
+        .repo()
+        .remote_at(url)?
+        .with_fetch_tags(gix::remote::fetch::Tags::None);
+    let (map, _) = remote.ref_map(
+        gix::progress::Discard,
+        gix::remote::ref_map::Options {
+            prefix_from_spec_as_filter_on_remote: false,
+            ..Default::default()
+        },
+    )?;
 
     let expected_ref = format!("refs/{ns}/main");
     let mut has_match = false;
     let mut other_namespaces = Vec::new();
 
-    for line in output.lines() {
-        // ls-remote format: "<sha>\t<refname>"
-        let refname = match line.split('\t').nth(1) {
-            Some(r) => r.trim(),
-            None => continue,
-        };
+    for reference in &map.remote_refs {
+        let refname = reference.unpack().0.to_string();
 
         if refname == expected_ref {
             has_match = true;
@@ -377,20 +383,9 @@ pub(crate) fn run_add(
         }
     }
 
-    // Write git config entries for the meta remote via subprocess
-    // (gix's config mutation API is limited; using git config is the reliable path)
-    let git_dir = repo.path();
-    let git_dir_str = git_dir.to_string_lossy();
-    let run = |args: &[&str]| -> Result<()> {
-        let mut full_args = vec!["--git-dir", &git_dir_str, "config"];
-        full_args.extend_from_slice(args);
-        let output = std::process::Command::new("git")
-            .args(&full_args)
-            .output()?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("git config failed: {}", stderr.trim());
-        }
+    let mut remote_config = repo.config_file_mut(repo.common_dir().join("config"))?;
+    let mut run = |args: &[&str]| -> Result<()> {
+        remote_config.set_raw_value(args[0], args[1])?;
         Ok(())
     };
 
@@ -417,6 +412,11 @@ pub(crate) fn run_add(
         run(&[&format!("{prefix}.metanamespace"), &ns])?;
     }
 
+    remote_config.commit()?;
+    let mut configured_repo = repo.clone();
+    configured_repo.reload()?;
+    let repo = &configured_repo;
+
     if side_ref {
         println!("{} side meta remote '{name}' -> {url}", s_out.ok("Added"));
     } else {
@@ -434,7 +434,14 @@ pub(crate) fn run_add(
 
         let push_refspec = format!("refs/{ns}/local/main:refs/{ns}/main");
         eprint!("{} refs/{ns}/main on {name}...", s_err.step("Initializing"));
-        match git_meta_lib::git_utils::run_git(repo, &["push", name, &push_refspec]) {
+        match git_meta_lib::git_utils::push(repo, name, &push_refspec).and_then(|status| {
+            match status {
+                gix::push::Status::Rejected(reason) => Err(git_meta_lib::Error::Other(format!(
+                    "push rejected: {reason:?}"
+                ))),
+                _ => Ok(()),
+            }
+        }) {
             Ok(_) => eprintln!(" {}", s_err.ok("done.")),
             Err(e) => {
                 eprintln!(" {}", s_err.err("failed."));
@@ -453,7 +460,7 @@ pub(crate) fn run_add(
     } else {
         format!("refs/{ns}/remotes/main")
     };
-    let fetch_refspec = format!("refs/{ns}/main:{tracking_ref}");
+    let fetch_refspec = format!("+refs/{ns}/main:{tracking_ref}");
     let depth_arg = depth.map(|depth| format!("--depth={depth}"));
     match depth_arg.as_deref() {
         Some(_) => eprint!(
@@ -464,13 +471,14 @@ pub(crate) fn run_add(
         None => eprint!("{} metadata (blobless)...", s_err.step("Fetching")),
     }
     let started = std::time::Instant::now();
-    let mut fetch_args = vec!["fetch", "--filter=blob:none"];
-    if let Some(arg) = depth_arg.as_deref() {
-        fetch_args.push(arg);
-    }
-    fetch_args.push(name);
-    fetch_args.push(&fetch_refspec);
-    match git_meta_lib::git_utils::run_git(repo, &fetch_args) {
+    let shallow = depth
+        .map(std::convert::TryInto::try_into)
+        .transpose()?
+        .map_or(
+            gix::remote::fetch::Shallow::NoChange,
+            gix::remote::fetch::Shallow::DepthAtRemote,
+        );
+    match git_meta_lib::git_utils::fetch(repo, name, [&fetch_refspec], shallow) {
         Ok(_) => {
             eprintln!(" {}", s_err.ok(&format!("done in {}.", elapsed(started))));
 
@@ -521,6 +529,14 @@ pub(crate) fn run_add(
             let _ = ctx.session.serialize()?;
             eprintln!(" {}", s_err.ok(&format!("done in {}.", elapsed(started))));
 
+            if !side_ref {
+                git_meta_lib::git_utils::hydrate_merge_base_blobs(
+                    repo,
+                    name,
+                    &format!("refs/{ns}/local/main"),
+                    &tracking_ref,
+                )?;
+            }
             eprint!("{} remote metadata...", s_err.step("Materializing"));
             let started = std::time::Instant::now();
             materialize::run(None, false, false, false)?;
@@ -581,22 +597,21 @@ pub(crate) fn run_remove(name: &str) -> Result<()> {
         bail!("'{name}' is not a metadata remote (no meta = true)");
     }
 
-    // Remove the git config section for this remote via subprocess
-    let git_dir = repo.path();
-    let git_dir_str = git_dir.to_string_lossy();
-    let unset = |key: &str| {
-        let _ = std::process::Command::new("git")
-            .args(["--git-dir", &git_dir_str, "config", "--unset-all", key])
-            .output();
-    };
-
-    unset(&format!("remote.{name}.url"));
-    unset(&format!("remote.{name}.fetch"));
-    unset(&format!("remote.{name}.meta"));
-    unset(&format!("remote.{name}.metaside"));
-    unset(&format!("remote.{name}.promisor"));
-    unset(&format!("remote.{name}.partialclonefilter"));
-    unset(&format!("remote.{name}.metanamespace"));
+    let mut config_file = repo.config_file_mut(repo.common_dir().join("config"))?;
+    for key in [
+        "url",
+        "fetch",
+        "meta",
+        "metaside",
+        "promisor",
+        "partialclonefilter",
+        "metanamespace",
+    ] {
+        if let Ok(mut values) = config_file.raw_values_mut(&format!("remote.{name}.{key}")) {
+            values.delete_all();
+        }
+    }
+    config_file.commit()?;
 
     // Delete refs under refs/{ns}/remotes/
     let ref_prefix = format!("refs/{ns}/remotes/");

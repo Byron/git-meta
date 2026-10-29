@@ -13,6 +13,10 @@ pub enum Error {
     #[error("git error: {0}")]
     Git(#[from] Box<dyn std::error::Error + Send + Sync>),
 
+    /// Gitoxide operation failed, retaining its error chain and classifications.
+    #[error(transparent)]
+    Gix(#[from] gix::Error),
+
     /// JSON serialization or deserialization failed.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
@@ -73,10 +77,6 @@ pub enum Error {
     /// Could not resolve a partial commit SHA or ref.
     #[error("could not resolve: {0}")]
     ResolveError(String),
-
-    /// A git subprocess command failed.
-    #[error("git command failed: {0}")]
-    GitCommand(String),
 
     /// No metadata remotes are configured.
     #[error("no metadata remotes configured")]

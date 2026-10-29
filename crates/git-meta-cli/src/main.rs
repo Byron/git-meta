@@ -60,9 +60,8 @@ fn main() -> Result<()> {
         commands::index_history::start_or_resume_in_background();
     }
 
-    // Pack what was just written, now that the work is done and this process is
-    // about to exit. Doing it while a session is still open would let Git
-    // delete objects from underneath that session's repository handle.
+    // Pack what was just written after normal work, avoiding maintenance latency
+    // during individual metadata writes.
     if writes_objects {
         if let Ok(session) = git_meta_lib::Session::discover() {
             session.maintain_object_store();

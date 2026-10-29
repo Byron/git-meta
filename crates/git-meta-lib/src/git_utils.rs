@@ -1,11 +1,9 @@
 //! Git repository helpers for resolving objects and manipulating metadata refs.
 
-use std::fmt::Display;
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 
 use crate::error::{Error, Result};
+use gix::error::{ErrorExt, ResultExt};
 
 // 4000 SHA-1 OIDs plus newlines is roughly 164 KiB, safely below the
 // smart-HTTP request size that made GitHub reject one-shot tip hydration.
@@ -24,48 +22,194 @@ pub(crate) fn is_list_entry_name(name: &str) -> bool {
     }
 }
 
-/// Resolve the working or git directory from a gix repository for subprocess calls.
-fn repo_dir(repo: &gix::Repository) -> Result<&std::path::Path> {
-    repo.workdir()
-        .unwrap_or_else(|| repo.git_dir())
-        .canonicalize()
-        .ok();
-    Ok(repo.workdir().unwrap_or_else(|| repo.git_dir()))
-}
-
-/// Run a git CLI command in the repository's working directory.
-///
-/// # Parameters
-///
-/// - `repo`: the Git repository whose working directory is used as `cwd`
-/// - `args`: the arguments to pass to `git`
-///
-/// # Returns
-///
-/// The stdout output of the command as a string.
+/// Count reachable metadata commits, honoring shallow boundaries.
 ///
 /// # Errors
-///
-/// Returns an error if the subprocess fails to spawn or exits with a non-zero status.
-pub fn run_git(repo: &gix::Repository, args: &[&str]) -> Result<String> {
-    let workdir = repo_dir(repo)?;
-
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(workdir)
-        .output()
-        .map_err(|e| Error::GitCommand(format!("{e}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(Error::GitCommand(format!(
-            "git {} failed: {}",
-            args.first().unwrap_or(&""),
-            stderr.trim()
-        )));
+/// Returns an error if the revision cannot be resolved or history cannot be read.
+pub fn count_commits(repo: &gix::Repository, revision: &str) -> Result<usize> {
+    let tip = repo
+        .rev_parse_single(revision)?
+        .object()?
+        .peel_to_commit()?
+        .id;
+    let mut count = 0;
+    for commit in repo.rev_walk([tip]).all()? {
+        commit?;
+        count += 1;
     }
+    Ok(count)
+}
 
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+/// Fetch explicit metadata refs or object IDs without invoking Git.
+///
+/// No tags, `FETCH_HEAD`, submodules, or maintenance are requested. Metadata remotes
+/// use their configured blobless filter; callers may override shallow history policy.
+///
+/// # Errors
+/// Returns an error if configuration, transfer, or reference updates fail.
+pub fn fetch(
+    repo: &gix::Repository,
+    remote_name: &str,
+    refspecs: impl IntoIterator<Item = impl AsRef<str>>,
+    shallow: gix::remote::fetch::Shallow,
+) -> Result<()> {
+    let mut remote = repo
+        .find_remote(remote_name)?
+        .with_fetch_tags(gix::remote::fetch::Tags::None);
+    remote.replace_refspecs(
+        refspecs
+            .into_iter()
+            .map(|spec| gix::bstr::BString::from(spec.as_ref())),
+        gix::remote::Direction::Fetch,
+    )?;
+    let filter = repo
+        .config_snapshot()
+        .string(&format!("remote.{remote_name}.partialclonefilter"));
+    let filter = match filter.as_deref() {
+        None => None,
+        Some(value) if value.as_slice() == b"blob:none" => {
+            Some(gix::remote::fetch::Filter::BlobNone)
+        }
+        Some(_) => {
+            return Err(Error::Other(
+                "unsupported metadata partial-clone filter".into(),
+            ))
+        }
+    };
+    let outcome = remote.fetch(
+        gix::remote::fetch::Options {
+            shallow,
+            filter,
+            ..remote.fetch_options()?
+        },
+        gix::progress::Discard,
+        &std::sync::atomic::AtomicBool::default(),
+    )?;
+    let updates = match &outcome.status {
+        gix::remote::fetch::Status::Change { update_refs, .. }
+        | gix::remote::fetch::Status::NoPackReceived { update_refs, .. } => update_refs,
+    };
+    if updates.updates.iter().any(|update| {
+        matches!(
+            update.mode,
+            gix::remote::fetch::refs::update::Mode::RejectedSourceObjectNotFound { .. }
+                | gix::remote::fetch::refs::update::Mode::RejectedTagUpdate
+                | gix::remote::fetch::refs::update::Mode::RejectedNonFastForward
+                | gix::remote::fetch::refs::update::Mode::RejectedToReplaceWithUnborn
+                | gix::remote::fetch::refs::update::Mode::RejectedCurrentlyCheckedOut { .. }
+        )
+    }) {
+        return Err(Error::Other(
+            "metadata fetch reference update was rejected".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Push an explicit reference update to every push URL, retaining typed rejection reasons.
+///
+/// # Errors
+/// Returns transport, configuration, and hook errors. Reference rejections are
+/// returned as a push status so callers can distinguish merge retries from failures.
+pub fn push(repo: &gix::Repository, remote_name: &str, refspec: &str) -> Result<gix::push::Status> {
+    let remote = repo.find_remote(remote_name)?;
+    let spec = gix::refspec::parse(
+        refspec.as_bytes().into(),
+        gix::refspec::parse::Operation::Push,
+    )?;
+    let update = gix::push::Update::from_refspec(repo, spec)?;
+    let source_name = spec
+        .source()
+        .map_or_else(|| "(delete)".into(), ToString::to_string);
+    let mut result = None;
+    for url in remote.urls(gix::remote::Direction::Push) {
+        let remote = remote
+            .clone()
+            .with_push_url_without_url_rewrite(url.clone())?;
+        let destination_result = (|| -> Result<gix::push::Status> {
+            let hook = |updates: &[gix::push::UpdateOutcome]| -> gix::Result<()> {
+                let mut input = String::new();
+                for outcome in updates.iter().filter(|outcome| {
+                    matches!(outcome.status, gix::push::Status::WouldUpdate { .. })
+                }) {
+                    let null = repo.object_hash().null();
+                    let new_id = outcome.update.new_id.unwrap_or(null);
+                    let old_id = outcome.old_id.unwrap_or(null);
+                    let local_ref = if outcome.update.destination == update.destination {
+                        source_name.clone()
+                    } else {
+                        outcome.update.destination.as_bstr().to_string()
+                    };
+                    use std::fmt::Write;
+                    writeln!(
+                        input,
+                        "{local_ref} {new_id} {} {old_id}",
+                        outcome.update.destination.as_bstr()
+                    )
+                    .or_error()?;
+                }
+                let url = remote
+                    .url(gix::remote::Direction::Push)
+                    .ok_or_else(|| gix::error::message("push URL is missing").raise())?;
+                let url = url.to_bstring();
+                let url = gix::path::from_bstr(&url)?;
+                let args = [std::ffi::OsStr::new(remote_name), url.as_os_str()];
+                for output in repo.run_hook_event_serially(
+                    "pre-push",
+                    gix::hook::Options {
+                        arguments: &args,
+                        stdin: Some(input.as_bytes()),
+                        ..Default::default()
+                    },
+                )? {
+                    use std::io::Write;
+                    std::io::stderr().write_all(&output.stderr).or_error()?;
+                    std::io::stdout().write_all(&output.stdout).or_error()?;
+                    if !output.status.success() {
+                        return Err(
+                            gix::error::message("pre-push hook rejected metadata push").raise()
+                        );
+                    }
+                }
+                Ok(())
+            };
+            let outcome = remote.push(
+                [update.clone()],
+                gix::push::Options {
+                    pre_push_hook: Some(&hook),
+                    ..Default::default()
+                },
+                gix::progress::Discard,
+                |_, bytes| {
+                    use std::io::Write;
+                    std::io::stderr().write_all(bytes)
+                },
+                &std::sync::atomic::AtomicBool::default(),
+            )?;
+            remote.update_tracking_refs(&outcome)?;
+            let mut updates = outcome.updates.into_iter();
+            let status = updates
+                .next()
+                .ok_or_else(|| Error::Other("metadata push returned no update status".into()))?
+                .status;
+            for derived in updates {
+                if let gix::push::Status::Rejected(reason) = derived.status {
+                    return Err(Error::Other(format!(
+                        "push of {} rejected: {reason:?}",
+                        derived.update.destination.as_bstr()
+                    )));
+                }
+            }
+            Ok(status)
+        })();
+        result = Some(match (result, destination_result) {
+            (Some(Err(error)), _) | (_, Err(error)) => Err(error),
+            (Some(Ok(status @ gix::push::Status::Rejected(_))), _)
+            | (Some(Ok(status)), Ok(gix::push::Status::UpToDate))
+            | (_, Ok(status)) => Ok(status),
+        });
+    }
+    result.unwrap_or_else(|| Err(Error::Other("push URL is missing".into())))
 }
 
 /// List all git remotes that have `meta = true` in their config.
@@ -111,7 +255,7 @@ pub fn list_meta_remotes(repo: &gix::Repository) -> Result<Vec<(String, String)>
 ///
 /// # Errors
 ///
-/// Returns an error if the ls-tree or fetch subprocess fails.
+/// Returns an error if tree traversal or the object fetch fails.
 pub fn hydrate_tip_blobs(repo: &gix::Repository, remote_name: &str, ref_name: &str) -> Result<()> {
     hydrate_tip_blobs_counted(repo, remote_name, ref_name)?;
     Ok(())
@@ -131,28 +275,47 @@ pub fn hydrate_tip_blobs(repo: &gix::Repository, remote_name: &str, ref_name: &s
 ///
 /// # Errors
 ///
-/// Returns an error if the ls-tree or fetch subprocess fails.
+/// Returns an error if tree traversal or the object fetch fails.
 pub fn hydrate_tip_blobs_counted(
     repo: &gix::Repository,
     remote_name: &str,
     ref_name: &str,
 ) -> Result<usize> {
-    let blob_list = run_git(repo, &["ls-tree", "-r", "--object-only", ref_name]);
+    let tree = repo.rev_parse_single(ref_name)?.object()?.peel_to_tree()?;
+    let entries = tree.traverse().breadthfirst.files()?;
+    let oids: Vec<_> = entries
+        .into_iter()
+        .filter(|entry| entry.mode.is_blob_or_symlink())
+        .map(|entry| entry.oid)
+        .collect();
+    let count = oids.len();
+    fetch_blob_oids(repo, remote_name, &oids)?;
+    Ok(count)
+}
 
-    match blob_list {
-        Ok(blobs) if !blobs.trim().is_empty() => {
-            let oids: Vec<&str> = blobs.lines().filter(|line| !line.is_empty()).collect();
-            let count = oids.len();
-
-            fetch_oid_batches(repo, remote_name, &oids, "blob hydration")?;
-
-            Ok(count)
-        }
-        Ok(_) => Ok(0),
-        Err(e) => Err(Error::GitCommand(format!(
-            "ls-tree failed for {ref_name}: {e}"
-        ))),
+/// Hydrate the common ancestor tree that metadata materialization reads for a three-way merge.
+///
+/// Resolve the current local and remote refs so synchronization can prepare the exact
+/// base used by materialization. No local ref or no common ancestor needs no fetch.
+/// Already present blobs are skipped; older history remains lazy.
+///
+/// # Errors
+/// Returns an error if refs, the merge base, or its objects cannot be read or fetched.
+pub fn hydrate_merge_base_blobs(
+    repo: &gix::Repository,
+    remote_name: &str,
+    local_ref: &str,
+    remote_ref: &str,
+) -> Result<()> {
+    let Some(local) = repo.try_find_reference(local_ref)? else {
+        return Ok(());
+    };
+    let local = local.into_fully_peeled_id()?;
+    let remote = repo.find_reference(remote_ref)?.into_fully_peeled_id()?;
+    if let Some(base) = repo.merge_base(local, remote)? {
+        hydrate_tip_blobs(repo, remote_name, &base.to_string())?;
     }
+    Ok(())
 }
 
 /// Look up a blob OID in a git tree by following a slash-separated path.
@@ -213,7 +376,7 @@ pub fn find_blob_oid_in_tree(
 /// Fetch specific blob OIDs from a remote.
 ///
 /// Similar to [`hydrate_tip_blobs`] but takes an explicit list of OIDs
-/// instead of discovering them via ls-tree.
+/// instead of discovering them by traversing the tip tree.
 ///
 /// # Parameters
 ///
@@ -223,7 +386,7 @@ pub fn find_blob_oid_in_tree(
 ///
 /// # Errors
 ///
-/// Returns an error if the fetch subprocess fails.
+/// Returns an error if fetching the requested objects fails.
 #[cfg_attr(not(feature = "internal"), allow(dead_code))]
 pub fn fetch_blob_oids(
     repo: &gix::Repository,
@@ -234,158 +397,34 @@ pub fn fetch_blob_oids(
         return Ok(());
     }
 
-    fetch_oid_batches(repo, remote_name, oids, "blob fetch")
+    fetch_oid_batches(repo, remote_name, oids)
 }
 
-fn fetch_oid_batches<T: Display>(
+fn fetch_oid_batches(
     repo: &gix::Repository,
     remote_name: &str,
-    oids: &[T],
-    operation: &str,
+    oids: &[gix::ObjectId],
 ) -> Result<()> {
-    let workdir = repo_dir(repo)?;
-
-    // GitHub rejects very large smart-HTTP request bodies. Keep each
-    // `fetch --stdin` want-list bounded while preserving sequential fetches.
-    let mut batches = 0;
     for batch in oid_batches(oids) {
-        fetch_oid_batch(workdir, remote_name, batch, operation)?;
-        batches += 1;
-    }
-
-    if batches > 1 {
-        consolidate_packs(workdir)?;
-    }
-
-    Ok(())
-}
-
-/// Merge the packs a batched fetch just produced into fewer, larger ones.
-///
-/// Every `git fetch` writes its own pack, so hydrating a large tip leaves one
-/// pack per batch. That is not merely untidy: `gix` sizes its object-database
-/// slot map when a repository is opened, and once the packs outnumber the slots
-/// every subsequent open fails with "The slotmap turned out to be too small".
-/// A consumer of a large metadata history would be unable to read what it had
-/// just downloaded.
-///
-/// Geometric repacking keeps this proportional to what was added rather than
-/// rewriting the whole object store on every fetch. Older Git versions do not
-/// support it, and a repository that cannot be repacked is not a reason to fail
-/// the fetch that already succeeded, so failures here are ignored.
-fn consolidate_packs(workdir: &Path) -> Result<()> {
-    let status = Command::new("git")
-        .args(["repack", "--geometric=2", "-d", "-q"])
-        .current_dir(workdir)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-
-    match status {
-        Ok(status) if status.success() => {}
-        // `--geometric` predates neither promisor packs nor every supported
-        // Git; fall back to a full repack, and give up quietly if that fails.
-        _ => {
-            let _ = Command::new("git")
-                .args(["repack", "-a", "-d", "-q"])
-                .current_dir(workdir)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
+        let missing: Vec<_> = batch
+            .iter()
+            .filter(|oid| !repo.has_object(**oid))
+            .map(ToString::to_string)
+            .collect();
+        if !missing.is_empty() {
+            fetch(
+                repo,
+                remote_name,
+                &missing,
+                gix::remote::fetch::Shallow::NoChange,
+            )?;
         }
     }
-
-    invalidate_commit_graph(workdir);
     Ok(())
-}
-
-/// Drop the commit-graph after repacking has moved objects around.
-///
-/// `git clone --filter` writes a commit-graph, and repacking can leave it
-/// naming objects the object database no longer holds. Git then refuses to
-/// fetch at all:
-///
-/// > fatal: You are attempting to fetch <oid>, which is in the commit graph
-/// > file but not in the object database. This is probably due to repo
-/// > corruption.
-///
-/// The graph is only a cache, so removing it is safe and Git rebuilds it when
-/// it wants one. Rewriting it instead would mean walking the whole history for
-/// something nothing has asked for yet.
-fn invalidate_commit_graph(workdir: &Path) {
-    let info = {
-        let in_worktree = workdir.join(".git").join("objects").join("info");
-        if in_worktree.exists() {
-            in_worktree
-        } else {
-            workdir.join("objects").join("info")
-        }
-    };
-    let _ = std::fs::remove_file(info.join("commit-graph"));
-    let _ = std::fs::remove_dir_all(info.join("commit-graphs"));
 }
 
 fn oid_batches<T>(oids: &[T]) -> impl Iterator<Item = &[T]> {
     oids.chunks(FETCH_OID_BATCH_SIZE)
-}
-
-fn fetch_oid_batch<T: Display>(
-    workdir: &Path,
-    remote_name: &str,
-    batch: &[T],
-    operation: &str,
-) -> Result<()> {
-    let mut child = Command::new("git")
-        .args([
-            "-c",
-            "fetch.negotiationAlgorithm=noop",
-            "fetch",
-            remote_name,
-            "--no-tags",
-            "--no-write-fetch-head",
-            "--recurse-submodules=no",
-            "--filter=blob:none",
-            "--stdin",
-        ])
-        .current_dir(workdir)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| Error::GitCommand(format!("{e}")))?;
-
-    let Some(mut stdin) = child.stdin.take() else {
-        return Err(Error::GitCommand(format!(
-            "{operation} failed: git fetch stdin was unavailable"
-        )));
-    };
-    let write_result = write_oid_batch(&mut stdin, batch);
-    drop(stdin);
-
-    let output = child
-        .wait_with_output()
-        .map_err(|e| Error::GitCommand(format!("{e}")))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let write_error = write_result
-            .err()
-            .map_or_else(String::new, |e| format!(" (stdin write failed: {e})"));
-        return Err(Error::GitCommand(format!(
-            "{operation} failed{write_error}: {}",
-            stderr.trim()
-        )));
-    }
-
-    write_result.map_err(|e| Error::GitCommand(format!("{operation} failed: {e}")))?;
-    Ok(())
-}
-
-fn write_oid_batch<T: Display>(writer: &mut impl Write, batch: &[T]) -> io::Result<()> {
-    for oid in batch {
-        writeln!(writer, "{oid}")?;
-    }
-
-    Ok(())
 }
 
 /// Resolve a meta remote by name, or pick the first one if no name given.
@@ -535,75 +574,26 @@ pub(crate) fn resolve_commit_sha(repo: &gix::Repository, partial: &str) -> Resul
 /// repository does not set `gc.auto`. The same default Git uses.
 const DEFAULT_GC_AUTO: i64 = 6_700;
 
-/// Pack what serialization has written and drop what it has superseded.
+/// Pack the objects serialization has written, retaining every local object.
 ///
-/// Metadata is written straight through `gix`, and a metadata-only repository
-/// runs nothing else, so without this the object store only ever grows loose:
-/// a 25,000-commit history reached 1.4 million loose objects in 14 GB, for a
-/// history that packs to 801 MB, and a plain `git ls-tree -r` on it took over
-/// five minutes.
+/// Metadata-only repositories have no other automatic maintenance. Compacting
+/// loose objects keeps their storage and lookup costs bounded. Retaining all
+/// objects protects concurrent writers and hydrated blobs whose parent trees
+/// have not been fetched into a partial store. The native repacker preserves
+/// promisor boundaries and object ages for later garbage collection.
 ///
-/// Repacking does nearly all of that work. Metadata commits form a linear
-/// chain, so every historical tree and blob stays reachable — superseded tree
-/// nodes are not garbage, they are the record the deep-history read path walks
-/// back through. On a 300-commit history only 208 of 36,245 objects were
-/// unreachable, and repacking took the rest from 36,037 loose to one.
-///
-/// Pruning is still worth doing, for a smaller reason. Building a tree writes
-/// intermediate trees that the finished commit never references, at roughly
-/// 0.7 objects per commit. Left alone they are what eventually trips `git gc`,
-/// which refuses to delete unreachable objects younger than two weeks, keeps
-/// them loose, and then declines to run at all:
-///
-/// > There are too many unreachable loose objects; run 'git prune' to remove
-/// > them. Automatic cleanup will not be performed until the file is removed.
-///
-/// That is why this does the work directly rather than deferring to
-/// `gc --auto`. Pruning first keeps the repack from packing objects about to
-/// be discarded, and geometric repacking keeps the work proportional to what
-/// was added rather than rewriting the whole store every time.
-///
-/// # This must not be called while a [`gix::Repository`] stays in use
-///
-/// Objects are deleted here. A `Repository` handle opened beforehand will find
-/// them gone and fail with "object ... could not be found". Call it where the
-/// process is about to exit, as the CLI does, or reopen every handle after.
-///
-/// Maintenance failing is never a reason to fail work that already succeeded,
+/// Maintenance is best attempted after normal work to avoid adding latency to
+/// individual writes. Failure never invalidates work that already succeeded,
 /// so errors are ignored.
 pub fn maintain_object_store(repo: &gix::Repository) {
-    let Ok(workdir) = repo_dir(repo) else {
-        return;
-    };
-    if !has_many_loose_objects(repo, workdir) {
-        return;
+    if has_many_loose_objects(repo) {
+        let _ = repo.repack_objects(&std::sync::atomic::AtomicBool::default());
     }
-
-    let run = |args: &[&str]| {
-        let _ = Command::new("git")
-            .args(args)
-            .current_dir(workdir)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-    };
-
-    run(&["prune", "--expire=now"]);
-    run(&["repack", "-d", "--geometric=2", "--quiet"]);
 }
 
-/// Whether the object store holds enough loose objects to be worth packing.
-///
-/// The threshold comes from the repository's `gc.auto`, so a project that has
-/// tuned Git's own maintenance gets the same answer here, and `gc.auto = 0`
-/// disables maintenance exactly as it does for Git.
-///
-/// Counting stops as soon as the threshold is passed, which bounds the work
-/// either way: a store below the threshold has few objects to count, and one
-/// far above it is answered after the first few thousand. Git samples a single
-/// fan-out directory instead, which is cheaper still but reads as zero when
-/// that one directory happens to be empty.
-fn has_many_loose_objects(repo: &gix::Repository, workdir: &Path) -> bool {
+/// Count only enough local loose objects to decide whether packing is useful.
+/// `gc.auto <= 0` disables automatic maintenance, as it does in Git.
+fn has_many_loose_objects(repo: &gix::Repository) -> bool {
     let threshold = repo
         .config_snapshot()
         .integer("gc.auto")
@@ -614,39 +604,11 @@ fn has_many_loose_objects(repo: &gix::Repository, workdir: &Path) -> bool {
     if threshold == 0 {
         return false;
     }
-
-    let objects = {
-        let in_worktree = workdir.join(".git").join("objects");
-        if in_worktree.exists() {
-            in_worktree
-        } else {
-            // Bare repositories keep `objects` at the top level.
-            workdir.join("objects")
-        }
-    };
-    let Ok(fanout) = std::fs::read_dir(objects) else {
-        return false;
-    };
-
-    let mut counted = 0usize;
-    for directory in fanout.flatten() {
-        let name = directory.file_name();
-        let name = name.to_string_lossy();
-        if name.len() != 2 || !name.chars().all(|c| c.is_ascii_hexdigit()) {
-            continue;
-        }
-        let Ok(entries) = std::fs::read_dir(directory.path()) else {
-            continue;
-        };
-        for _ in entries.flatten() {
-            counted += 1;
-            if counted > threshold {
-                return true;
-            }
-        }
-    }
-
-    false
+    gix::odb::loose::Store::at(repo.objects.store_ref().path(), repo.object_hash())
+        .iter()
+        .filter_map(std::result::Result::ok)
+        .nth(threshold)
+        .is_some()
 }
 
 #[cfg(test)]
@@ -665,79 +627,6 @@ mod tests {
         assert!(!is_list_entry_name("-23c0f")); // empty timestamp
     }
 
-    /// Each batched fetch lands its own pack. Once those outnumber the slots
-    /// gix sizes its object database with, opening the repository fails
-    /// outright — so a multi-batch fetch has to leave the packs consolidated.
-    #[test]
-    fn consolidate_packs_merges_the_packs_a_batched_fetch_leaves_behind() {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let path = dir.path();
-        let run = |args: &[&str]| {
-            let output = std::process::Command::new("git")
-                .current_dir(path)
-                .args(args)
-                .output()
-                .expect("git");
-            assert!(
-                output.status.success(),
-                "git {args:?}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
-        };
-
-        run(&["init", "--quiet"]);
-        run(&["config", "user.email", "test@example.com"]);
-        run(&["config", "user.name", "Test User"]);
-
-        // Build several single-object packs, the shape a batched fetch leaves.
-        for index in 0..4 {
-            std::fs::write(path.join("f"), format!("content {index}")).expect("write");
-            let oid = run(&["hash-object", "-w", "f"]);
-            let mut child = std::process::Command::new("git")
-                .current_dir(path)
-                .args(["pack-objects", "--quiet", ".git/objects/pack/pack"])
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::null())
-                .spawn()
-                .expect("pack-objects");
-            {
-                use std::io::Write;
-                let stdin = child.stdin.as_mut().expect("stdin");
-                writeln!(stdin, "{oid}").expect("write oid");
-            }
-            assert!(child.wait().expect("wait").success());
-        }
-
-        let count_packs = || {
-            std::fs::read_dir(path.join(".git/objects/pack"))
-                .expect("pack dir")
-                .flatten()
-                .filter(|e| e.path().extension().is_some_and(|x| x == "pack"))
-                .count()
-        };
-        assert!(count_packs() >= 4, "test setup did not create packs");
-
-        // A commit-graph naming objects the repack moves would make Git refuse
-        // to fetch afterwards, so consolidation has to drop it.
-        run(&["commit", "--quiet", "--allow-empty", "-m", "graph"]);
-        run(&["commit-graph", "write", "--reachable"]);
-        let commit_graph = path.join(".git/objects/info/commit-graph");
-        assert!(commit_graph.exists(), "test setup wrote no commit-graph");
-
-        consolidate_packs(path).expect("consolidate");
-
-        assert!(
-            count_packs() < 4,
-            "packs were not consolidated, still {}",
-            count_packs()
-        );
-        assert!(
-            !commit_graph.exists(),
-            "a commit-graph survived the repack that moved its objects"
-        );
-    }
-
     #[test]
     fn oid_batches_splits_large_oid_lists() {
         assert_eq!(FETCH_OID_BATCH_SIZE, 4000);
@@ -746,14 +635,5 @@ mod tests {
         let sizes: Vec<usize> = oid_batches(&oids).map(<[_]>::len).collect();
 
         assert_eq!(sizes, vec![4000, 1]);
-    }
-
-    #[test]
-    fn write_oid_batch_terminates_each_oid() {
-        let mut payload = Vec::new();
-
-        write_oid_batch(&mut payload, &["abc", "def"]).unwrap();
-
-        assert_eq!(payload, b"abc\ndef\n");
     }
 }

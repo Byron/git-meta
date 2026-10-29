@@ -32,7 +32,7 @@ terminal_size = "0.4.4"
 [dev-dependencies]
 assert_cmd = "2"
 gix = { workspace = true }
-gix-testtools = "0.18"
+gix-testtools = { version = "0.22.0", git = "https://github.com/GitoxideLabs/gitoxide", branch = "grix", default-features = false, features = ["sha1", "worktree-exclusions"] }
 predicates = "3"
 serde_json = { workspace = true }
 sha1 = { workspace = true }

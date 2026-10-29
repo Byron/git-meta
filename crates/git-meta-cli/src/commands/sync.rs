@@ -47,7 +47,7 @@ fn remotes_to_sync(ctx: &CommandContext, remote: Option<&str>) -> Result<Vec<Str
 fn pull_remote(ctx: &CommandContext, remote_name: &str, verbose: bool) -> Result<()> {
     if verbose {
         let ns = ctx.session.namespace();
-        let fetch_refspec = format!("refs/{ns}/main:refs/{ns}/remotes/main");
+        let fetch_refspec = format!("+refs/{ns}/main:refs/{ns}/remotes/main");
         eprintln!("[verbose] remote: {remote_name}");
         eprintln!("[verbose] fetch refspec: {fetch_refspec}");
     }

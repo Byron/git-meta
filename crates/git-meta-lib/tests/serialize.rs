@@ -596,14 +596,9 @@ fn local_tree(dir: &tempfile::TempDir) -> gix::ObjectId {
     commit.tree_id().unwrap().detach()
 }
 
-/// Maintenance must not run while the session that wrote the objects is still
-/// in use. `gc.autoDetach` defaults to true, so `git gc --auto` returns
-/// immediately and keeps packing in the background, deleting the loose objects
-/// it packs — and a `Repository` handle opened before that finishes then fails
-/// with "object ... could not be found".
-///
-/// This asserts the safe order: serialize repeatedly with a live session and
-/// nothing disappears, then maintain once the work is done.
+/// Serializing repeatedly must preserve objects in the live session. Maintenance
+/// used to start detached Git GC, which could remove objects behind that handle.
+/// Native maintenance runs explicitly after writes and retains their contents.
 #[test]
 fn serializing_repeatedly_does_not_lose_objects_to_maintenance() {
     let (dir, repo) = setup_repo();
@@ -611,8 +606,7 @@ fn serializing_repeatedly_does_not_lose_objects_to_maintenance() {
     let session = open_session(repo);
 
     // Enough rounds to pass the default loose-object threshold, so the test
-    // does not depend on gc.auto being configured. gc.autoDetach is left at
-    // its default, so a background gc would race if serialize triggered one.
+    // does not depend on gc.auto being configured.
     let target = Target::commit(&sha).unwrap();
     for round in 0..900 {
         session
@@ -620,8 +614,7 @@ fn serializing_repeatedly_does_not_lose_objects_to_maintenance() {
             .set(&format!("agent:step-{round}"), format!("value-{round}"))
             .unwrap();
         let _ = session.serialize().unwrap();
-        // Read back through the same session, which is what a background gc
-        // would break.
+        // Keep reading through the same session as its object store grows.
         assert_eq!(
             session
                 .target(&target)
@@ -634,7 +627,7 @@ fn serializing_repeatedly_does_not_lose_objects_to_maintenance() {
     let before = loose_object_count(dir.path());
     assert!(before > 0, "expected loose objects before maintenance");
 
-    // Maintenance is safe here: the work is finished.
+    // Pack after the batch, keeping the existing session alive.
     session.maintain_object_store();
 
     assert!(

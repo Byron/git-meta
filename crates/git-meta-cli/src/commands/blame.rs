@@ -1,6 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::Write;
-use std::process::Command;
+
+use gix::bstr::ByteSlice;
 
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
@@ -18,21 +19,25 @@ use git_meta_lib::MetaValue;
 /// # Parameters
 ///
 /// - `path`: the repository path to blame.
-/// - `rev`: optional revision to pass to `git blame`.
+/// - `rev`: optional revision to blame instead of worktree contents.
 /// - `porcelain`: when true, emit full JSON grouped blame data.
 /// - `json`: when true, emit compact JSON with line ranges and PR metadata.
 ///
 /// # Errors
 ///
-/// Returns an error if `git blame` fails, porcelain output cannot be parsed, or
-/// metadata lookup/output serialization fails.
+/// Returns an error if the path or revision cannot be read, blame fails, or metadata
+/// lookup/output serialization fails.
 pub(crate) fn run(path: &str, rev: Option<&str>, porcelain: bool, json: bool) -> Result<()> {
     if porcelain && json {
         bail!("cannot use --json and --porcelain together");
     }
     let ctx = CommandContext::open(None)?;
-    let output = run_git_blame(path, rev)?;
-    let lines = parse_porcelain(&output)?;
+    let lines = blame_lines(
+        ctx.session.repo(),
+        path,
+        rev,
+        time::OffsetDateTime::now_utc().unix_timestamp(),
+    )?;
     hydrate_blame_metadata(&ctx.session, &lines)?;
     let groups = group_blame(ctx.session.store(), &lines)?;
 
@@ -60,21 +65,77 @@ const BRANCH_METADATA_KEYS: &[&str] = &[
     "released-in",
 ];
 
-fn run_git_blame(path: &str, rev: Option<&str>) -> Result<String> {
-    let mut command = Command::new("git");
-    command.args(["blame", "--porcelain"]);
-    if let Some(rev) = rev {
-        command.arg(rev);
+fn blame_lines(
+    repo: &gix::Repository,
+    path: &str,
+    rev: Option<&str>,
+    now: i64,
+) -> Result<Vec<BlameLine>> {
+    let normalized_path = repo.normalize_path(path)?;
+    let options = gix::repository::blame_file::Options {
+        rewrites: Some(Default::default()),
+        textconv: true,
+        ..Default::default()
+    };
+    let outcome = if let Some(rev) = rev {
+        let commit = repo.rev_parse_single(rev)?.object()?.peel_to_commit()?;
+        repo.blame_file(&normalized_path, commit.id, options)?
+    } else {
+        repo.blame_worktree_file(path.as_bytes().as_bstr(), options)?
+    };
+    let mailmap = repo.open_mailmap();
+    let quote_high_bytes = repo
+        .config_snapshot()
+        .try_boolean("core.quotePath")?
+        .unwrap_or(true);
+    let mut lines = Vec::new();
+    for (entry, source_lines) in outcome.entries_with_lines() {
+        let (author, author_time, summary) = if entry.commit_id.is_null() {
+            (
+                "Not Committed Yet".to_string(),
+                now.to_string(),
+                format!("Version of {normalized_path} from {normalized_path}"),
+            )
+        } else {
+            let commit = repo.find_commit(entry.commit_id)?;
+            let signature = commit.author()?;
+            let author = mailmap.resolve(signature);
+            (
+                author.name.to_str()?.to_string(),
+                author.time.seconds.to_string(),
+                commit.message()?.summary().to_str()?.to_string(),
+            )
+        };
+        let previous = outcome
+            .previous_origins
+            .get(&(entry.commit_id, entry.source_file_name.clone()))
+            .map(|origin| {
+                format!(
+                    "{} {}",
+                    origin.commit_id,
+                    gix::quote::ansi_c::quote_with(
+                        origin.source_file_name.as_bstr(),
+                        quote_high_bytes
+                    )
+                )
+            });
+        for (offset, text) in source_lines.into_iter().enumerate() {
+            let text = text.to_str().context("blame source was not valid UTF-8")?;
+            let text = text.strip_suffix('\n').unwrap_or(text);
+            let text = text.strip_suffix('\r').unwrap_or(text);
+            lines.push(BlameLine {
+                commit: entry.commit_id.to_string(),
+                original_line: entry.start_in_source_file + offset as u32 + 1,
+                final_line: entry.start_in_blamed_file + offset as u32 + 1,
+                author: Some(author.clone()),
+                author_time: Some(author_time.clone()),
+                summary: Some(summary.clone()),
+                previous: previous.clone(),
+                text: text.to_string(),
+            });
+        }
     }
-    command.args(["--", path]);
-    let output = command
-        .output()
-        .with_context(|| format!("failed to run git blame for {path}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("git blame failed for {path}: {}", stderr.trim());
-    }
-    String::from_utf8(output.stdout).context("git blame output was not valid UTF-8")
+    Ok(lines)
 }
 
 #[derive(Debug, Clone)]
@@ -87,74 +148,6 @@ struct BlameLine {
     summary: Option<String>,
     previous: Option<String>,
     text: String,
-}
-
-#[derive(Default)]
-struct PendingLine {
-    commit: String,
-    original_line: u32,
-    final_line: u32,
-    metadata: HashMap<String, String>,
-}
-
-fn parse_porcelain(output: &str) -> Result<Vec<BlameLine>> {
-    let mut lines = Vec::new();
-    let mut cached_metadata: HashMap<String, HashMap<String, String>> = HashMap::new();
-    let mut pending: Option<PendingLine> = None;
-
-    for line in output.lines() {
-        if let Some(header) = parse_header(line) {
-            pending = Some(header);
-            continue;
-        }
-
-        if let Some(text) = line.strip_prefix('\t') {
-            let Some(current) = pending.take() else {
-                bail!("git blame porcelain source line appeared before a header");
-            };
-            let mut metadata = cached_metadata
-                .get(&current.commit)
-                .cloned()
-                .unwrap_or_default();
-            metadata.extend(current.metadata);
-            cached_metadata.insert(current.commit.clone(), metadata.clone());
-            lines.push(BlameLine {
-                commit: current.commit,
-                original_line: current.original_line,
-                final_line: current.final_line,
-                author: metadata.get("author").cloned(),
-                author_time: metadata.get("author-time").cloned(),
-                summary: metadata.get("summary").cloned(),
-                previous: metadata.get("previous").cloned(),
-                text: text.to_string(),
-            });
-            continue;
-        }
-
-        if let Some(current) = pending.as_mut() {
-            if let Some((key, value)) = line.split_once(' ') {
-                current.metadata.insert(key.to_string(), value.to_string());
-            }
-        }
-    }
-
-    Ok(lines)
-}
-
-fn parse_header(line: &str) -> Option<PendingLine> {
-    let mut parts = line.split_whitespace();
-    let commit = parts.next()?;
-    if commit.len() < 40 || !commit.chars().all(|c| c.is_ascii_hexdigit()) {
-        return None;
-    }
-    let original_line = parts.next()?.parse::<u32>().ok()?;
-    let final_line = parts.next()?.parse::<u32>().ok()?;
-    Some(PendingLine {
-        commit: commit.to_string(),
-        original_line,
-        final_line,
-        metadata: HashMap::new(),
-    })
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -715,27 +708,6 @@ fn truncate_to_width(value: &str, width: usize) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_repeated_porcelain_metadata() {
-        let input = "\
-84a1d9b840d428fc523f6ffc1f8adfb43ab5918d 1 1 1
-author Alice
-author-time 1775001600
-summary feat: add thing
-filename file.txt
-\tfirst
-84a1d9b840d428fc523f6ffc1f8adfb43ab5918d 2 2 1
-\tsecond
-";
-
-        let lines = parse_porcelain(input).unwrap();
-        assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0].author.as_deref(), Some("Alice"));
-        assert_eq!(lines[1].author_time.as_deref(), Some("1775001600"));
-        assert_eq!(lines[1].author.as_deref(), Some("Alice"));
-        assert_eq!(lines[1].summary.as_deref(), Some("feat: add thing"));
-    }
 
     #[test]
     fn truncates_to_requested_width() {
